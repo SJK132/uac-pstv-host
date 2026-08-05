@@ -215,8 +215,6 @@ snippets, and a diagnostic log.
 
 ## Credits
 
-- **Tian** — project direction, hardware testing, listening tests, measurements,
-  and compatibility validation on PSTV and RME hardware.
 - **OpenAI Codex** — driver architecture, implementation, optimization,
   host-side tests, build tooling, and documentation.
 - **Anthropic Claude** — independent code review and a mixer/drain-race revision
@@ -231,9 +229,4 @@ snippets, and a diagnostic log.
   USB streaming work that informed the investigation.
 - The VitaSDK, taiHEN, HENkaku, Ensō, YAMT, and StorageMgr contributors.
 
-## License
 
-UAC PSTV is released under the [BSD Zero Clause License](LICENSE) (`0BSD`). It
-permits use, copying, modification, and distribution for any purpose, with or
-without a fee and without an attribution condition. The license retains the
-standard warranty and liability disclaimer.
