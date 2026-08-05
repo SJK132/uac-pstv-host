@@ -1,0 +1,13 @@
+uacPstvBoot:
+  attributes: 0
+  version:
+    major: 0
+    minor: 1
+  main:
+    start: module_start
+    stop: module_stop
+  libraries:
+    uacPstvBootForDriver:
+      functions:
+        - uac_core_is_attached
+        - uac_core_set_audio_callbacks
