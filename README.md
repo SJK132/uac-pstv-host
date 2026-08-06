@@ -166,8 +166,6 @@ diagnostic log.
 
 ## Credits
 
-- **Tian** — project direction, hardware testing, listening tests, measurements,
-  and compatibility validation on PSTV and RME hardware.
 - **OpenAI Codex** — driver architecture, implementation, optimization,
   host-side tests, build tooling, and documentation.
 - **Anthropic Claude** — independent code review and a mixer/drain-race revision
