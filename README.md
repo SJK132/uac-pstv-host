@@ -36,6 +36,11 @@ two-channel, 16-bit isochronous OUT alternate setting.
 
 The release contains one self-contained module: `uac_pstv.skprx`.
 
+> [!WARNING]
+> **StorageMgr users:** `uac_pstv.skprx` must appear before
+> `storagemgr.skprx` under `*KERNEL`. Otherwise, the USB audio device may not
+> be detected during boot.
+
 1. Copy `dist/uac_pstv.skprx` to `ur0:tai/`.
 2. Add it once under `*KERNEL` in `ur0:tai/config.txt`.
 3. Remove obsolete `uac_pstv_boot.skprx`, `uac_pstv_audio.skprx`, and
@@ -43,40 +48,11 @@ The release contains one self-contained module: `uac_pstv.skprx`.
    from `ur0:tai/boot_config.txt`.
 4. Reboot with the adapter connected. Hot-plugging after boot is also supported.
 
-### StorageMgr ordering
-
-StorageMgr is conditionally supported. UAC PSTV **must appear above
-StorageMgr** so its USB driver is registered before StorageMgr initializes the
-USB path:
-
 ```text
 *KERNEL
 ur0:tai/uac_pstv.skprx
 ur0:tai/storagemgr.skprx
 ```
-
-The tested StorageMgr mapping is:
-
-```text
-INT=imc0
-GCD=ux0
-UMA=uma0
-```
-
-### YAMT ordering
-
-YAMT's tested startup sequence leaves enough time for the normal UAC plugin to
-register, so no early-boot helper is needed. Leave YAMT's own boot entry where
-its installer placed it and keep the normal UAC entry under `*KERNEL`:
-
-```text
-*KERNEL
-ur0:tai/yamt_helper.skprx
-ur0:tai/uac_pstv.skprx
-```
-
-Place any other SceAudio-hooking plugin after UAC PSTV. Multiple audio-hook
-plugins are not guaranteed to cooperate.
 
 ## Logging
 
@@ -99,18 +75,6 @@ Or from Windows PowerShell:
 
 The diagnostic module is written to `dist/debug/`. Messages use `[uac-pstv]`.
 Reinstall the normal file from `dist/` after diagnosis.
-
-## Plugin compatibility
-
-The PSTV has one physical USB host port, so a USB audio adapter and USB storage
-device cannot occupy it simultaneously.
-
-| Plugin or feature | Status | Notes |
-|---|---|---|
-| StorageMgr | Conditional | `uac_pstv.skprx` must be above `storagemgr.skprx`. Tested with `INT=imc0`, `GCD=ux0`, `UMA=uma0`. |
-| YAMT Lite | Compatible | Suitable for SD2Vita, internal storage, or a memory card with UAC PSTV. |
-| YAMT Full | Conditional | Delayed USB startup is tested. Keep experimental USB patches and forced legacy USB/PSVSD mode disabled, and do not use the port as active USB mass storage while using audio. |
-| HDMI | Compatible | UAC PSTV does not patch or disable HDMI output. |
 
 ## How it works
 
@@ -178,7 +142,7 @@ diagnostic log.
 - [vita-udcd-uvc](https://github.com/xerpi/vita-udcd-uvc) and
   [Vita-USB-Stream](https://github.com/BenMitnicK/Vita-USB-Stream) — prior Vita
   USB streaming work that informed the investigation.
-- The VitaSDK, taiHEN, HENkaku, Ensō, YAMT, and StorageMgr contributors.
+- The VitaSDK, taiHEN, HENkaku, Ensō, and StorageMgr contributors.
 
 ## License
 
