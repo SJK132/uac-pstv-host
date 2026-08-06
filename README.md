@@ -43,10 +43,7 @@ The release contains one self-contained module: `uac_pstv.skprx`.
 
 1. Copy `dist/uac_pstv.skprx` to `ur0:tai/`.
 2. Add it once under `*KERNEL` in `ur0:tai/config.txt`.
-3. Remove obsolete `uac_pstv_boot.skprx`, `uac_pstv_audio.skprx`, and
-   `vita_uac_host.skprx` entries. In particular, remove any old UAC helper line
-   from `ur0:tai/boot_config.txt`.
-4. Reboot with the adapter connected. Hot-plugging after boot is also supported.
+3. Reboot with the adapter connected. Hot-plugging after boot is also supported.
 
 ```text
 *KERNEL
