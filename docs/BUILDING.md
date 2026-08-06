@@ -65,12 +65,11 @@ From the repository directory mounted in WSL:
 bash ./build.sh
 ```
 
-The script runs the native correctness and deterministic drain/race tests,
-builds the two kernel modules, verifies that release VELFs contain no logging
-symbols/imports/strings, and copies them to `dist/`. Logging-enabled builds go
-to `dist/debug/` instead. Its CMake build tree
-defaults to `/tmp/uac-pstv-build`; keeping generated VitaSDK files off `/mnt/c`
-avoids DrvFS permission limitations.
+The script runs native correctness and deterministic drain/race tests, builds
+the core, verifies that the release VELF contains no logging
+symbols/imports/strings, and copies it to `dist/`. Logging-enabled builds go to
+`dist/debug/`. The CMake tree defaults to `/tmp/uac-pstv-build`; keeping
+generated VitaSDK files off `/mnt/c` avoids DrvFS permission limitations.
 
 Useful overrides:
 
@@ -101,20 +100,20 @@ cmake -S . -B /tmp/uac-pstv-build \
 cmake --build /tmp/uac-pstv-build -j2
 ```
 
-Expected artifacts:
+Expected artifact:
 
 ```text
-/tmp/uac-pstv-build/uac_pstv_boot.skprx
-/tmp/uac-pstv-build/uac_pstv_audio.skprx
+/tmp/uac-pstv-build/uac_pstv.skprx
 ```
 
 ## Release checks
 
 Before publishing a binary release:
 
-1. Run both host tests.
+1. Run the host tests and benchmarks.
 2. Build with logging explicitly set to `OFF`.
-3. Confirm both `.skprx` files are present in `dist/`.
+3. Confirm `uac_pstv.skprx` is present in `dist/` and obsolete helper artifacts
+   are absent.
 4. Update `dist/SHA256SUMS.txt`.
 5. Test cold boot, reboot, hot-plug, game audio, LiveArea effects, and BGM on a
    PSTV with a recovery method available.

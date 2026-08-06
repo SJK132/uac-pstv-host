@@ -5,26 +5,23 @@
 USB Audio Class 1.0 output for PlayStation TV.
 
 UAC PSTV redirects game, LiveArea, system-effect, and background-music PCM to a
-compatible USB audio output. The transport is intentionally narrow: stereo,
-16-bit PCM at 48 kHz over UAC1. Keeping that contract fixed made the driver
-small, predictable, and stable on the PSTV's USB host controller.
+compatible USB audio output. The USB transport is intentionally fixed at
+48 kHz, stereo, signed 16-bit PCM for predictable operation on the PSTV host
+controller.
 
-> [!WARNING]
-> `uac_pstv_boot.skprx` is an early-boot kernel module. Back up
-> `ur0:tai/boot_config.txt` and make sure you have a recovery method before
-> editing it. A typo or bad boot-module order can prevent a normal boot.
+The plugin uses the normal taiHEN `*KERNEL` configuration and does not modify
+`boot_config.txt`, so the usual hold-L recovery path remains available.
 
 ## At a glance
 
 | | Support |
 |---|---|
-| Release | v0.1 |
 | Console | PlayStation TV only |
 | USB protocol | UAC1 output |
 | Output format | 48,000 Hz, stereo, signed 16-bit PCM |
 | Vita audio | Games, LiveArea/system effects, and BGM ports |
 | Hot-plug | Yes |
-| Device present during boot | Yes, with the required early-boot order |
+| Device present during boot | Yes with the tested plugin ordering |
 | HDMI | Left untouched; it continues to operate |
 | UAC2 / direct RME ADI-2 USB | Not supported yet |
 | Debug logging | Compiled out by default |
@@ -37,82 +34,58 @@ two-channel, 16-bit isochronous OUT alternate setting.
 
 ## Installation
 
-The release contains two modules because they must load at different stages:
+The release contains one self-contained module: `uac_pstv.skprx`.
 
-| File | Configuration | Purpose |
-|---|---|---|
-| `uac_pstv_boot.skprx` | Ensō `ur0:tai/boot_config.txt` | Registers the UAC1 USB driver before enumeration and owns the isochronous stream |
-| `uac_pstv_audio.skprx` | taiHEN `ur0:tai/config.txt` under `*KERNEL` | Captures and mixes SceAudio output after taiHEN is available |
+1. Copy `dist/uac_pstv.skprx` to `ur0:tai/`.
+2. Add it once under `*KERNEL` in `ur0:tai/config.txt`.
+3. Remove obsolete `uac_pstv_boot.skprx`, `uac_pstv_audio.skprx`, and
+   `vita_uac_host.skprx` entries. In particular, remove any old UAC helper line
+   from `ur0:tai/boot_config.txt`.
+4. Reboot with the adapter connected. Hot-plugging after boot is also supported.
 
-Do not place both modules in `config.txt`, and do not place the audio module in
-`boot_config.txt`.
+### StorageMgr ordering
 
-### 1. Copy the modules
-
-Copy these files from [`dist`](dist/) to `ur0:tai/`:
-
-```text
-uac_pstv_boot.skprx
-uac_pstv_audio.skprx
-```
-
-Release hashes are recorded in [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt).
-
-Remove or comment out any older `vita_uac_host.skprx` entry. Loading the old
-driver alongside UAC PSTV can duplicate SceAudio hooks or make two USB drivers
-compete for the same device.
-
-### 2. Add the early USB module
-
-Open `ur0:tai/boot_config.txt`. Find Sony's existing USB block and insert the
-UAC line **immediately after `usbd.skprx` and before both `udcd.skprx` and
-`usbserv.skprx`**:
-
-```text
-load os0:kd/usbd.skprx
-- load ur0:tai/uac_pstv_boot.skprx
-load os0:kd/udcd.skprx
-load os0:kd/usbserv.skprx
-```
-
-The whitespace between `load` and the path may be spaces or a tab. Preserve all
-other model- and firmware-specific lines in the file. In particular:
-
-- Do not move or duplicate `usbd.skprx`.
-- Do not put UAC PSTV before `usbd.skprx`; it imports `SceUsbdForDriver`.
-- Do not put it after `udcd.skprx` or `usbserv.skprx`; the USB device may already
-  have been enumerated by then.
-- If YAMT already has an early `- load ur0:tai/yamt.skprx` line, leave that line
-  where YAMT installed it. Only place the UAC line relative to Sony's USB block
-  as shown above.
-
-### 3. Add the audio module
-
-Open `ur0:tai/config.txt` and add the following line once under `*KERNEL`:
+StorageMgr is conditionally supported. UAC PSTV **must appear above
+StorageMgr** so its USB driver is registered before StorageMgr initializes the
+USB path:
 
 ```text
 *KERNEL
-ur0:tai/uac_pstv_audio.skprx
+ur0:tai/uac_pstv.skprx
+ur0:tai/storagemgr.skprx
 ```
 
-It may share the existing `*KERNEL` section with other plugins. The recommended
-order is storage/system plugins first, UAC PSTV next, and any other plugin that
-hooks SceAudio after it. Multiple SceAudio-hooking plugins are not guaranteed to
-cooperate, so start with those disabled when diagnosing missing or duplicated
-audio.
+The tested StorageMgr mapping is:
 
-### 4. Reboot and test
+```text
+INT=imc0
+GCD=ux0
+UMA=uma0
+```
 
-Connect the UAC1 adapter before powering on, then reboot the PSTV. Audio should
-begin when a supported device is attached and remain idle when no device is
-present. Hot-plug is supported after boot.
+### YAMT ordering
+
+YAMT's tested startup sequence leaves enough time for the normal UAC plugin to
+register, so no early-boot helper is needed. Leave YAMT's own boot entry where
+its installer placed it and keep the normal UAC entry under `*KERNEL`:
+
+```text
+*KERNEL
+ur0:tai/yamt_helper.skprx
+ur0:tai/uac_pstv.skprx
+```
+
+Place any other SceAudio-hooking plugin after UAC PSTV. Multiple audio-hook
+plugins are not guaranteed to cooperate.
+
+## Logging
 
 > [!NOTE]
-> **No log file from the included binaries is expected.** Logging is a
+> **No log file from the included binary is expected.** Logging is a
 > compile-time build option and is disabled in every release artifact. It
 > cannot be enabled through `config.txt` on the PSTV.
 
-For diagnostics, build logging-enabled modules from WSL2:
+For diagnostics, build with logging enabled:
 
 ```bash
 UAC_PSTV_ENABLE_LOGGING=ON bash ./build.sh
@@ -124,97 +97,77 @@ Or from Windows PowerShell:
 .\build.ps1 -Logging
 ```
 
-The diagnostic modules are written to `dist/debug/`. Copy both of those
-modules to `ur0:tai/`, reboot, and then read `ur0:data/uac_pstv.log`. Messages
-use the `[uac-pstv-boot]` and `[uac-pstv-audio]` prefixes. Reinstall the normal
-modules from `dist/` after diagnosis.
+The diagnostic module is written to `dist/debug/`. Messages use `[uac-pstv]`.
+Reinstall the normal file from `dist/` after diagnosis.
 
 ## Plugin compatibility
 
-The PSTV has one physical USB host port, so a USB audio adapter and a USB
-storage device cannot be plugged into that port simultaneously. StorageMgr can
-remain installed: its mass-storage driver does not claim a UAC audio device.
+The PSTV has one physical USB host port, so a USB audio adapter and USB storage
+device cannot occupy it simultaneously.
 
 | Plugin or feature | Status | Notes |
 |---|---|---|
-| StorageMgr | Compatible | It can remain installed with the tested `INT=imc0`, `GCD=ux0`, `UMA=uma0` layout. A connected UAC device is not claimed as USB mass storage. |
-| YAMT Lite | Compatible | Recommended when using SD2Vita, internal storage, or a memory card with UAC PSTV. |
-| YAMT Full | Conditional | Keep **Enable experimental USB patches** and **Force legacy USB/PSVSD mode** disabled. Do not configure the PSTV USB port as active mass storage while using the audio adapter. |
-
-The tested StorageMgr mapping is:
-
-```text
-INT=imc0
-GCD=ux0
-UMA=uma0
-```
+| StorageMgr | Conditional | `uac_pstv.skprx` must be above `storagemgr.skprx`. Tested with `INT=imc0`, `GCD=ux0`, `UMA=uma0`. |
+| YAMT Lite | Compatible | Suitable for SD2Vita, internal storage, or a memory card with UAC PSTV. |
+| YAMT Full | Conditional | Delayed USB startup is tested. Keep experimental USB patches and forced legacy USB/PSVSD mode disabled, and do not use the port as active USB mass storage while using audio. |
+| HDMI | Compatible | UAC PSTV does not patch or disable HDMI output. |
 
 ## How it works
 
-The early module registers a narrow `SceUsbd` class driver, selects the matching
-UAC1 alternate interface, fixes the endpoint at 48 kHz, and continuously submits
-192-byte isochronous OUT packets. The late module hooks SceAudio port
-open/config/output/release calls, converts active sources to 48 kHz stereo, and
-feeds the transport through a small callback bridge.
+The module registers its UAC1 driver, fixes a matching endpoint at 48 kHz, and
+submits one 192-byte isochronous OUT packet per millisecond. Native 48 kHz
+stereo takes a bit-exact direct-copy path.
 
-The bridge is designed so the audio module can unload safely: it disables new
-callbacks and drains any callback already in progress before its code is
-released. With no supported USB device attached, there is no isochronous stream
-and PCM pushes return before copying or resampling audio.
+Other supported Vita source rates use a compact 24-tap fixed-point polyphase
+FIR. This resampling is necessary for 44.1 kHz BGM; the USB link itself always
+remains at 48 kHz. The audio path performs no allocation or floating-point
+work. With no supported adapter attached, no USB stream runs and captured PCM
+returns before copying or resampling.
 
-The USB copy is taken before Sony's final hardware output stage. As a result,
-system master-volume or post-processing behavior may not exactly match HDMI;
-use the DAC's volume control when needed.
+The USB copy is taken before Sony's final hardware output stage. System master
+volume or post-processing may therefore differ from HDMI; use the DAC's volume
+control when needed.
 
 ## Building
 
-The quickest build from WSL2 is:
+The quickest WSL2 build is:
 
 ```bash
 bash ./build.sh
 ```
 
-This runs the host-side mixer and drain/race tests, builds both modules with
-VitaSDK, and copies the results to `dist/`. The build directory defaults to
-`/tmp/uac-pstv-build` to avoid DrvFS permission problems.
+This runs host-side mixer and race tests, builds `uac_pstv.skprx` with VitaSDK,
+verifies that logging is absent from a release build, and copies the artifact
+to `dist/`. The build tree defaults to `/tmp/uac-pstv-build` to avoid DrvFS
+permission problems.
 
-From Windows PowerShell, the wrapper performs the same build through WSL2:
+The PowerShell wrapper performs the same build:
 
 ```powershell
 .\build.ps1
 ```
 
-For the complete toolchain setup, see [Building on Windows with WSL2](docs/BUILDING.md).
-
-To include file logging in a diagnostic build:
-
-```bash
-UAC_PSTV_ENABLE_LOGGING=ON bash ./build.sh
-```
-
-Release builds leave logging off and do not link the debug or file-I/O logger
-imports. Diagnostic artifacts are placed in `dist/debug/` so they cannot
-overwrite the release binaries. Do not report timing or performance results
-from a logging-enabled build as release behavior.
+For complete setup instructions, see [Building on Windows with WSL2](docs/BUILDING.md).
 
 ## Project status and limitations
 
 - Current target: PSTV, UAC1, 48 kHz, stereo, 16-bit PCM.
 - UAC2 and direct USB output to devices such as the RME ADI-2 are future work.
-- 44.1 kHz Vita sources are resampled internally; the USB link remains fixed at
-  48 kHz.
-- USB hubs and multi-device combinations have not been validated as supported
-  release configurations, apart from basic HID coexistence observed during
-  development.
-- This is kernel software. Keep backups and test new builds with a recovery path
-  available.
+- 8, 11.025, 12, 16, 22.05, 24, 32, and 44.1 kHz Vita sources are resampled
+  internally; the USB link remains fixed at 48 kHz.
+- USB hubs and multi-device combinations have not been validated as release
+  configurations, apart from basic HID coexistence observed during development.
+- This is kernel software. Keep backups and test new builds with a recovery
+  path available.
 
-When reporting a device issue, include the PSTV firmware, adapter VID:PID, full
-UAC descriptors if available, storage-plugin configuration, both plugin-order
-snippets, and a diagnostic log.
+When reporting an issue, include the PSTV firmware, adapter VID:PID, full UAC
+descriptors if available, storage-plugin configuration and ordering, and a
+diagnostic log.
 
 ## Credits
 
+- **Tian** — project direction, hardware testing, listening tests, measurements,
+  and compatibility validation on PSTV and RME hardware.
 - **OpenAI Codex** — driver architecture, implementation, optimization,
   host-side tests, build tooling, and documentation.
 - **Anthropic Claude** — independent code review and a mixer/drain-race revision
@@ -229,4 +182,9 @@ snippets, and a diagnostic log.
   USB streaming work that informed the investigation.
 - The VitaSDK, taiHEN, HENkaku, Ensō, YAMT, and StorageMgr contributors.
 
+## License
 
+UAC PSTV is released under the [BSD Zero Clause License](LICENSE) (`0BSD`). It
+permits use, copying, modification, and distribution for any purpose, with or
+without a fee and without an attribution condition. The license retains the
+standard warranty and liability disclaimer.

@@ -1,1 +1,27 @@
-dist/
+# CMake and VitaSDK output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.elf
+*.velf
+*.suprx
+*.skprx
+
+# Native test output
+*.o
+*.obj
+*.exe
+*.out
+*.pdb
+tests/test_mixer
+tests/test_race
+tests/bench_fill
+tests/bench_resampler
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

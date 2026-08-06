@@ -6,7 +6,7 @@
 #include <psp2kern/kernel/cpu/cache.h>
 #include <stdint.h>
 
-#define LOG_PREFIX "[uac-pstv-boot] "
+#define LOG_PREFIX "[uac-pstv] "
 
 #define USB_DT_CS_INTERFACE 0x24
 #define USB_DT_CS_ENDPOINT 0x25
@@ -51,11 +51,6 @@ static uint32_t probe_count;
 static uint32_t attach_count;
 static uint32_t detach_count;
 #endif
-
-int uac_core_is_attached(void)
-{
-	return __atomic_load_n(&active.device_id, __ATOMIC_ACQUIRE) >= 0;
-}
 
 static uint16_t read_le16(const uint8_t *p)
 {

@@ -1,12 +1,13 @@
 #include "stream.h"
 #include "log.h"
+#include "mixer.h"
 
 #include <psp2kern/usbd.h>
 #include <psp2kern/kernel/cpu/cache.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <string.h>
 
-#define LOG_PREFIX "[uac-pstv-boot] "
+#define LOG_PREFIX "[uac-pstv] "
 
 /* One UAC1 OUT packet: 48 stereo 16-bit frames, 1 ms at 48 kHz. */
 #define STREAM_BUFFER_BYTES 192
@@ -15,7 +16,6 @@
  * retire before the caller closes the pipe underneath it. */
 #define STREAM_STOP_POLL_US 1000
 #define STREAM_STOP_POLLS 20
-#define CALLBACK_DRAIN_POLLS 20
 
 typedef struct {
 	int16_t buffer[STREAM_BUFFER_BYTES / sizeof(int16_t)]
@@ -31,79 +31,10 @@ static uint32_t callback_active;
 #ifdef UAC_PSTV_ENABLE_LOGGING
 static int stream_error;
 #endif
-static UacCoreFillCallback audio_fill;
-static UacCoreStateCallback audio_state;
-static uint32_t audio_callback_active;
-static int audio_callbacks_enabled;
 
 static void fill_audio(int16_t *output)
 {
-	UacCoreFillCallback fill;
-
-	memset(output, 0, STREAM_BUFFER_BYTES);
-	if (!__atomic_load_n(&audio_callbacks_enabled, __ATOMIC_ACQUIRE))
-		return;
-	__atomic_fetch_add(&audio_callback_active, 1, __ATOMIC_ACQUIRE);
-	if (__atomic_load_n(&audio_callbacks_enabled, __ATOMIC_ACQUIRE)) {
-		fill = __atomic_load_n(&audio_fill, __ATOMIC_ACQUIRE);
-		if (fill != NULL)
-			fill(output);
-	}
-	__atomic_fetch_sub(&audio_callback_active, 1, __ATOMIC_RELEASE);
-}
-
-static void notify_audio_state(int running)
-{
-	UacCoreStateCallback state;
-
-	if (!__atomic_load_n(&audio_callbacks_enabled, __ATOMIC_ACQUIRE))
-		return;
-	__atomic_fetch_add(&audio_callback_active, 1, __ATOMIC_ACQUIRE);
-	if (__atomic_load_n(&audio_callbacks_enabled, __ATOMIC_ACQUIRE)) {
-		state = __atomic_load_n(&audio_state, __ATOMIC_ACQUIRE);
-		if (state != NULL)
-			state(running);
-	}
-	__atomic_fetch_sub(&audio_callback_active, 1, __ATOMIC_RELEASE);
-}
-
-int uac_core_set_audio_callbacks(UacCoreFillCallback fill,
-	UacCoreStateCallback state)
-{
-	int wait;
-	UacCoreStateCallback old_state;
-
-	if ((fill == NULL) != (state == NULL))
-		return -1;
-	if (fill != NULL) {
-		if (__atomic_load_n(&audio_callbacks_enabled, __ATOMIC_ACQUIRE))
-			return -1;
-		__atomic_store_n(&audio_fill, fill, __ATOMIC_RELEASE);
-		__atomic_store_n(&audio_state, state, __ATOMIC_RELEASE);
-		__atomic_store_n(&audio_callbacks_enabled, 1, __ATOMIC_RELEASE);
-		if (__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE)) {
-			notify_audio_state(1);
-			/* If stop raced the notification, it normally sends state 0.
-			 * This recheck also covers stop just before callbacks enabled. */
-			if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE))
-				notify_audio_state(0);
-		}
-		return 0;
-	}
-
-	old_state = __atomic_load_n(&audio_state, __ATOMIC_ACQUIRE);
-	__atomic_store_n(&audio_callbacks_enabled, 0, __ATOMIC_RELEASE);
-	for (wait = 0; wait < CALLBACK_DRAIN_POLLS &&
-		__atomic_load_n(&audio_callback_active, __ATOMIC_ACQUIRE) != 0;
-		++wait)
-		ksceKernelDelayThread(STREAM_STOP_POLL_US);
-	if (__atomic_load_n(&audio_callback_active, __ATOMIC_ACQUIRE) != 0)
-		return -1;
-	if (old_state != NULL)
-		old_state(0);
-	__atomic_store_n(&audio_fill, NULL, __ATOMIC_RELEASE);
-	__atomic_store_n(&audio_state, NULL, __ATOMIC_RELEASE);
-	return 0;
+	uac_mixer_fill(output);
 }
 
 static void prepare_request(StreamRequest *request)
@@ -125,7 +56,7 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *request,
 		__atomic_store_n(&stream_error, result, __ATOMIC_RELEASE);
 #endif
 		__atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
-		notify_audio_state(0);
+		uac_mixer_stop();
 		goto done;
 	}
 	if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE))
@@ -145,7 +76,7 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *request,
 		__atomic_store_n(&stream_error, submit, __ATOMIC_RELEASE);
 #endif
 		__atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
-		notify_audio_state(0);
+		uac_mixer_stop();
 	}
 done:
 	__atomic_fetch_sub(&callback_active, 1, __ATOMIC_RELEASE);
@@ -170,7 +101,7 @@ int uac_stream_start(int pipe_id, uint16_t packet_bytes, uint8_t speed,
 	__atomic_store_n(&stream_error, 0, __ATOMIC_RELEASE);
 #endif
 	__atomic_store_n(&stream_running, 1, __ATOMIC_RELEASE);
-	notify_audio_state(1);
+	uac_mixer_start();
 	memset(&stream_request, 0, sizeof(stream_request));
 	stream_request.transfer.buffer_base = stream_request.buffer;
 	stream_request.transfer.relative_start_frame = 1;
@@ -183,7 +114,7 @@ int uac_stream_start(int pipe_id, uint16_t packet_bytes, uint8_t speed,
 		transfer_done, &stream_request);
 	if (result < 0) {
 		__atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
-		notify_audio_state(0);
+		uac_mixer_stop();
 		uac_log(LOG_PREFIX "stream queue failed: 0x%08x\n", result);
 		return result;
 	}
@@ -203,7 +134,7 @@ void uac_stream_stop(void)
 	was_running = __atomic_exchange_n(&stream_running, 0,
 		__ATOMIC_ACQ_REL);
 	if (was_running)
-		notify_audio_state(0);
+		uac_mixer_stop();
 	for (wait = 0; wait < STREAM_STOP_POLLS &&
 		__atomic_load_n(&callback_active, __ATOMIC_ACQUIRE) != 0; ++wait)
 		ksceKernelDelayThread(STREAM_STOP_POLL_US);

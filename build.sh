@@ -30,33 +30,31 @@ cmake -S "$project_dir" -B "$build_dir" \
 cmake --build "$build_dir" -j"$jobs"
 
 if [[ "$logging" == "OFF" ]]; then
-  for image in \
-    "$build_dir/uac_pstv_boot_kernel.velf" \
-    "$build_dir/uac_pstv_audio_kernel.velf"; do
-    if arm-vita-eabi-readelf -Ws "$image" |
-        grep -Eq 'uac_log|SceDebugForDriver|SceIofilemgrForDriver'; then
-      echo "Release verification failed: logging symbol or import in $image" >&2
-      exit 1
-    fi
-    if strings "$image" |
-        grep -Eq 'uac_pstv\.log|\[uac-pstv-(boot|audio)\]'; then
-      echo "Release verification failed: logging string in $image" >&2
-      exit 1
-    fi
-  done
+  image="$build_dir/uac_pstv_kernel.velf"
+  if arm-vita-eabi-readelf -Ws "$image" |
+      grep -Eq 'uac_log|SceDebugForDriver|SceIofilemgrForDriver'; then
+    echo "Release verification failed: logging symbol or import in $image" >&2
+    exit 1
+  fi
+  if strings "$image" |
+      grep -Eq 'uac_pstv\.log|\[uac-pstv'; then
+    echo "Release verification failed: logging string in $image" >&2
+    exit 1
+  fi
   output_dir="$project_dir/dist"
 else
   output_dir="$project_dir/dist/debug"
 fi
 
 mkdir -p "$output_dir"
-cp "$build_dir/uac_pstv_boot.skprx" "$output_dir/"
-cp "$build_dir/uac_pstv_audio.skprx" "$output_dir/"
+cp "$build_dir/uac_pstv.skprx" "$output_dir/"
+rm -f "$output_dir/uac_pstv_audio.skprx" \
+  "$output_dir/uac_pstv_boot.skprx"
 
 if [[ "$logging" == "OFF" ]]; then
   (
     cd "$output_dir"
-    sha256sum uac_pstv_boot.skprx uac_pstv_audio.skprx > SHA256SUMS.txt
+    sha256sum uac_pstv.skprx > SHA256SUMS.txt
   )
 fi
 

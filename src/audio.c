@@ -13,7 +13,6 @@
 #define SCE_AUDIO_RELEASE_PORT_NID 0x69E2E6B5u
 #define SCE_AUDIO_SET_CONFIG_NID 0xB8BA0D07u
 #define SCE_AUDIO_GET_CONFIG_NID 0x9C8EDAEAu
-#define AUDIO_PORT_SLOTS 8
 
 static tai_hook_ref_t output_ref;
 static tai_hook_ref_t open_ref;
@@ -36,7 +35,7 @@ typedef struct {
 	uint32_t sequence;
 } __attribute__((aligned(32))) AudioPort;
 
-static AudioPort ports[AUDIO_PORT_SLOTS];
+static AudioPort ports[UAC_AUDIO_SOURCE_SLOTS];
 static int ports_lock;
 static uint32_t port_generation;
 
@@ -67,7 +66,7 @@ static void end_port_write(AudioPort *entry)
 static int find_port_locked(SceUID pid, int port)
 {
 	int index;
-	for (index = 0; index < AUDIO_PORT_SLOTS; ++index)
+	for (index = 0; index < UAC_AUDIO_SOURCE_SLOTS; ++index)
 		if (ports[index].frames != 0 && ports[index].pid == pid &&
 			ports[index].port == port)
 			return index;
@@ -78,7 +77,7 @@ static int find_port_snapshot(SceUID pid, int port, uint32_t *frames,
 	uint32_t *generation)
 {
 	int index;
-	for (index = 0; index < AUDIO_PORT_SLOTS; ++index) {
+	for (index = 0; index < UAC_AUDIO_SOURCE_SLOTS; ++index) {
 		uint32_t sequence = __atomic_load_n(&ports[index].sequence,
 			__ATOMIC_ACQUIRE);
 		uint32_t count;
@@ -170,7 +169,7 @@ static int register_port(SceUID pid, int port, uint32_t frames,
 		return -1;
 	if (!try_lock_ports())
 		return -1;
-	for (index = 0; index < AUDIO_PORT_SLOTS; ++index) {
+	for (index = 0; index < UAC_AUDIO_SOURCE_SLOTS; ++index) {
 		if (ports[index].frames != 0 && ports[index].pid == pid &&
 			ports[index].port == port) {
 			slot = index;
@@ -383,7 +382,7 @@ void uac_audio_fini(void)
 		taiHookReleaseForKernel(get_config_hook, get_config_ref);
 	if (open_hook >= 0)
 		taiHookReleaseForKernel(open_hook, open_ref);
-	for (index = 0; index < AUDIO_PORT_SLOTS; ++index)
+	for (index = 0; index < UAC_AUDIO_SOURCE_SLOTS; ++index)
 		uac_mixer_source_close(index);
 	config_hook = -1;
 	release_hook = -1;

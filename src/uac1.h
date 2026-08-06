@@ -6,6 +6,5 @@
 int uac1_probe(int device_id);
 int uac1_attach(int device_id);
 int uac1_detach(int device_id);
-int uac_core_is_attached(void);
 
 #endif

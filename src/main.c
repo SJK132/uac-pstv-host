@@ -7,20 +7,40 @@
 #include <psp2kern/kernel/modulemgr.h>
 #include <psp2kern/kernel/suspend.h>
 #include <psp2kern/usbserv.h>
+#include <psp2kern/usbd.h>
 
-#define LOG_PREFIX "[uac-pstv-audio] "
+#define LOG_PREFIX "[uac-pstv] "
 
 static int started;
+static int owns_usb_driver;
 
-static void mixer_state(int running)
+static const SceUsbdDriver uac_driver = {
+	.name = "uac_pstv",
+	.probe = uac1_probe,
+	.attach = uac1_attach,
+	.detach = uac1_detach,
+};
+static int register_usb_driver(void)
 {
-	/* The core only raises running after a supported UAC1 device attaches.
-	 * Keep the attachment check here as a second boundary: disconnected
-	 * systems never activate the mixer. */
-	if (running && uac_core_is_attached())
-		uac_mixer_start();
-	else
-		uac_mixer_stop();
+	int result = ksceUsbdRegisterDriver(&uac_driver);
+
+	uac_log(LOG_PREFIX "USB register: 0x%08x\n", result);
+	if (result >= 0)
+		owns_usb_driver = 1;
+	return result;
+}
+
+static int unregister_usb_driver(void)
+{
+	int result;
+
+	if (!owns_usb_driver)
+		return 0;
+	result = ksceUsbdUnregisterDriver(&uac_driver);
+	uac_log(LOG_PREFIX "USB unregister: 0x%08x\n", result);
+	if (result >= 0)
+		owns_usb_driver = 0;
+	return result;
 }
 
 static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
@@ -44,35 +64,22 @@ int module_start(SceSize args, const void *argp)
 	(void)args;
 	(void)argp;
 
-	/* The boot_config core owns UAC transport. This late taiHEN helper only
-	 * installs audio hooks and supplies PCM while that transport is active. */
 	result = ksceUsbServMacSelect(2, 0);
-	uac_log(LOG_PREFIX "host select: 0x%08x, attached %d\n", result,
-		uac_core_is_attached());
 	if (result < 0)
+		return SCE_KERNEL_START_FAILED;
+	if (register_usb_driver() < 0)
 		return SCE_KERNEL_START_FAILED;
 
 	result = uac_audio_init();
 	if (result < 0) {
 		uac_audio_fini();
+		(void)unregister_usb_driver();
 		return SCE_KERNEL_START_FAILED;
 	}
-	result = uac_core_set_audio_callbacks(uac_mixer_fill, mixer_state);
-	uac_log(LOG_PREFIX "audio bridge register: 0x%08x\n", result);
-	if (result < 0) {
-		uac_audio_fini();
-		return SCE_KERNEL_START_FAILED;
-	}
-
-	if (!uac_core_is_attached())
-		uac_log(LOG_PREFIX
-			"no UAC1 device; mixer and stream remain stopped\n");
-
 	started = 1;
-	result = ksceKernelRegisterSysEventHandler("uac_pstv_audio_sysevent",
+	result = ksceKernelRegisterSysEventHandler("uac_pstv_sysevent",
 		uac_sysevent_handler, NULL);
 	uac_log(LOG_PREFIX "sysevent register: 0x%08x\n", result);
-
 	return SCE_KERNEL_START_SUCCESS;
 }
 
@@ -83,10 +90,12 @@ int module_stop(SceSize args, const void *argp)
 	(void)argp;
 
 	started = 0;
-	result = uac_core_set_audio_callbacks(NULL, NULL);
-	uac_log(LOG_PREFIX "audio bridge unregister: 0x%08x\n", result);
-	if (result < 0)
+	result = unregister_usb_driver();
+	if (result < 0) {
+		started = 1;
 		return SCE_KERNEL_STOP_FAIL;
+	}
+	uac_mixer_stop();
 	uac_audio_fini();
 	return SCE_KERNEL_STOP_SUCCESS;
 }

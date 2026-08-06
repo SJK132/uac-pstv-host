@@ -7,7 +7,7 @@ proposed.
 Before opening a pull request:
 
 ```bash
-make -C tests clean test race
+make -C tests clean test race bench
 bash ./build.sh
 ```
 
@@ -20,7 +20,6 @@ Device reports should include:
 - PSTV firmware and Ensō/YAMT version
 - USB VID:PID and full UAC descriptors
 - Storage and USB-related plugins
-- Relevant `boot_config.txt` and `config.txt` ordering
+- Relevant storage plugin and `config.txt` ordering
 - Whether cold boot, reboot, and hot-plug differ
 - `ur0:data/uac_pstv.log` from a logging-enabled build
-

@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define UAC_AUDIO_SOURCE_SLOTS 4
+
 /* Producer side: driven by the SceAudio hooks in audio.c, one source per
  * open SceAudio port, called from the porting app's own thread. */
 int uac_mixer_source_open(int source, uint32_t rate, int mode,

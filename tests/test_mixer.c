@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "mixer.h"
 
@@ -27,6 +28,7 @@ void uac_log(const char *format, ...)
 
 #define FRAMES 48
 #define SAMPLES (FRAMES * 2)
+#define PI 3.14159265358979323846
 
 static int failures;
 
@@ -293,6 +295,225 @@ static void test_inactive_push_ignored(void)
 	uac_mixer_stop();
 }
 
+static int expected_resampled_frames(uint32_t rate, uint32_t input_frames)
+{
+	uint32_t input_count = input_frames;
+	uint32_t input_index = 0;
+	uint32_t phase = 0;
+	int outputs = 0;
+
+	while ((uint32_t)(input_count - input_index) > 12u) {
+		outputs++;
+		phase += rate;
+		if (phase >= 48000u) {
+			phase -= 48000u;
+			input_index++;
+		}
+	}
+	return outputs;
+}
+
+static void test_all_resample_rates(void)
+{
+	static const uint32_t rates[] = {
+		8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100
+	};
+	static int16_t in[441 * 2];
+	int16_t out[SAMPLES];
+	int ok = 1;
+	uint32_t rate_index;
+
+	printf("test: every supported source rate has exact DC gain and cadence\n");
+	for (rate_index = 0; rate_index < sizeof(rates) / sizeof(rates[0]);
+		++rate_index) {
+		uint32_t rate = rates[rate_index];
+		uint32_t input_frames = rate / 100u;
+		int expected = expected_resampled_frames(rate, input_frames);
+		int produced = 0;
+		int packet;
+		uint32_t frame;
+
+		for (frame = 0; frame < input_frames; ++frame) {
+			in[frame * 2u] = 6000;
+			in[frame * 2u + 1u] = -6000;
+		}
+		uac_mixer_start();
+		uac_mixer_source_open(0, rate, 1, rate_index + 1u);
+		uac_mixer_source_push(0, 1, in, input_frames,
+			rate_index + 1u);
+		for (packet = 0; packet < 12; ++packet) {
+			uac_mixer_fill(out);
+			for (frame = 0; frame < FRAMES; ++frame) {
+				if (out[frame * 2u] == 0 &&
+					out[frame * 2u + 1u] == 0)
+					continue;
+				produced++;
+				if (out[frame * 2u] < 5980 ||
+					out[frame * 2u] > 6020 ||
+					out[frame * 2u + 1u] < -6020 ||
+					out[frame * 2u + 1u] > -5980)
+					ok = 0;
+			}
+		}
+		if (produced != expected) {
+			printf("    %u Hz produced %d, expected %d\n",
+				rate, produced, expected);
+			ok = 0;
+		}
+		uac_mixer_source_close(0);
+		uac_mixer_stop();
+	}
+	check(ok, "8-44.1 kHz cadence and constant-signal gain are correct");
+}
+
+static void collect_resampled(const int16_t *input, int frames,
+	const int *chunks, int chunk_count, int16_t *output, int output_frames)
+{
+	int consumed = 0;
+	int chunk = 0;
+	int written = 0;
+	int16_t packet[SAMPLES];
+
+	uac_mixer_start();
+	uac_mixer_source_open(0, 44100, 1, 100);
+	while (consumed < frames) {
+		int take = chunks == NULL ? frames : chunks[chunk++ % chunk_count];
+		if (take > frames - consumed)
+			take = frames - consumed;
+		uac_mixer_source_push(0, 1, input + consumed * 2, take, 100);
+		consumed += take;
+	}
+	while (written < output_frames) {
+		int take = output_frames - written;
+		if (take > FRAMES)
+			take = FRAMES;
+		uac_mixer_fill(packet);
+		memcpy(output + written * 2, packet, take * 4u);
+		written += take;
+	}
+	uac_mixer_source_close(0);
+	uac_mixer_stop();
+}
+
+static void test_resample_chunk_continuity(void)
+{
+	static int16_t input[441 * 2];
+	static int16_t whole[480 * 2];
+	static int16_t split[480 * 2];
+	static const int chunks[] = { 1, 7, 31, 2, 64, 5, 113, 19 };
+	int frame;
+
+	printf("test: resampler state is independent of input buffer boundaries\n");
+	for (frame = 0; frame < 441; ++frame) {
+		input[frame * 2] = (int16_t)((frame * 7919) & 0x7fff);
+		input[frame * 2 + 1] = (int16_t)-input[frame * 2];
+	}
+	collect_resampled(input, 441, NULL, 0, whole, 480);
+	collect_resampled(input, 441, chunks,
+		sizeof(chunks) / sizeof(chunks[0]), split, 480);
+	check(memcmp(whole, split, sizeof(whole)) == 0,
+		"arbitrary buffer splits are bit-identical");
+}
+
+static double resampler_tone_snr(uint32_t rate, int frequency)
+{
+	static int16_t input[480 * 2];
+	static int16_t output[3840 * 2];
+	int16_t packet[SAMPLES];
+	double sine_sum = 0.0;
+	double cosine_sum = 0.0;
+	double sine_square = 0.0;
+	double cosine_square = 0.0;
+	double cross = 0.0;
+	double sine_amplitude;
+	double cosine_amplitude;
+	double signal_power = 0.0;
+	double noise_power = 0.0;
+	int output_frame = 0;
+	int block;
+	int frame;
+	const int first = 480;
+	const int final = 3840;
+	const int input_block = rate / 100u;
+
+	uac_mixer_start();
+	uac_mixer_source_open(0, rate, 1, 200);
+	for (block = 0; block < 10; ++block) {
+		for (frame = 0; frame < input_block; ++frame) {
+			double angle = 2.0 * PI * frequency *
+				(block * input_block + frame) / rate;
+			int16_t sample = (int16_t)lrint(12000.0 * sin(angle));
+			input[frame * 2] = sample;
+			input[frame * 2 + 1] = sample;
+		}
+		uac_mixer_source_push(0, 1, input, input_block, 200);
+		for (int packet_index = 0; packet_index < 8; ++packet_index) {
+			uac_mixer_fill(packet);
+			memcpy(output + output_frame * 2, packet, sizeof(packet));
+			output_frame += FRAMES;
+		}
+	}
+	for (frame = first; frame < final; ++frame) {
+		double angle = 2.0 * PI * frequency * frame / 48000.0;
+		double sample = output[frame * 2];
+		double sine = sin(angle);
+		double cosine = cos(angle);
+		sine_sum += sample * sine;
+		cosine_sum += sample * cosine;
+		sine_square += sine * sine;
+		cosine_square += cosine * cosine;
+		cross += sine * cosine;
+	}
+	{
+		double determinant = sine_square * cosine_square - cross * cross;
+		sine_amplitude = (sine_sum * cosine_square -
+			cosine_sum * cross) / determinant;
+		cosine_amplitude = (cosine_sum * sine_square -
+			sine_sum * cross) / determinant;
+	}
+	for (frame = first; frame < final; ++frame) {
+		double angle = 2.0 * PI * frequency * frame / 48000.0;
+		double expected = sine_amplitude * sin(angle) +
+			cosine_amplitude * cos(angle);
+		double error = output[frame * 2] - expected;
+		signal_power += expected * expected;
+		noise_power += error * error;
+	}
+	uac_mixer_source_close(0);
+	uac_mixer_stop();
+	return 10.0 * log10(signal_power / noise_power);
+}
+
+static void test_resampler_spectral_quality(void)
+{
+	static const uint32_t rates[] = {
+		8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100
+	};
+	double snr_10k;
+	double snr_18k;
+	int all_rates_ok = 1;
+	uint32_t index;
+
+	printf("test: 44.1k -> 48k FIR suppresses interpolation hiss\n");
+	snr_10k = resampler_tone_snr(44100, 10000);
+	snr_18k = resampler_tone_snr(44100, 18000);
+	printf("    residual SNR: 10 kHz %.1f dB, 18 kHz %.1f dB\n",
+		snr_10k, snr_18k);
+	check(snr_10k > 50.0, "10 kHz residual is below -50 dB");
+	check(snr_18k > 38.0, "18 kHz residual is below -38 dB");
+	printf("test: every resampled rate suppresses near-Nyquist images\n");
+	for (index = 0; index < sizeof(rates) / sizeof(rates[0]); ++index) {
+		int frequency = (int)(rates[index] * 2u / 5u);
+		double snr = resampler_tone_snr(rates[index], frequency);
+
+		printf("    %5u Hz source, %5d Hz tone: %.1f dB\n",
+			rates[index], frequency, snr);
+		if (snr < 35.0)
+			all_rates_ok = 0;
+	}
+	check(all_rates_ok, "all non-native rates exceed 35 dB at 80% Nyquist");
+}
+
 static void test_stale_generation_ignored(void)
 {
 	int16_t in[FRAMES * 2], out[SAMPLES];
@@ -340,6 +561,9 @@ int main(void)
 	test_drain_no_underflow();
 	test_mono_upmix();
 	test_resample_rate();
+	test_all_resample_rates();
+	test_resample_chunk_continuity();
+	test_resampler_spectral_quality();
 	test_upsample_burst_no_corruption();
 	test_inactive_push_ignored();
 	test_stale_generation_ignored();
