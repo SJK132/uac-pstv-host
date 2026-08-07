@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3 - 2026-08-06
+
+- Refactored uac1, mixer, stream class, and renamed audio to audio_hooks.
+- fixed a bug where psx game with sample rate of 44148 have no in game audio.
+
+- Area needs improvement: currently the isochronous usb transfer function
+  with callback can not satisfy 48Khz audio, during on device testing we are
+  seeing 1.4% of dropped sample from ring buffer. 
+
 ## v0.2 - 2026-08-05
 
 - Replaced the separate early-boot and audio modules with one self-contained
