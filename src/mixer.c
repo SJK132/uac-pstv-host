@@ -8,241 +8,314 @@
 
 #define LOG_PREFIX "[uac-pstv-audio] "
 
-/* One uac_mixer_fill() produces exactly one UAC1 OUT packet: 192 bytes =
- * 48 stereo 16-bit frames = 1 ms at 48 kHz. */
-#define MIXER_FRAME_BYTES 192
-#define MIXER_FRAMES (MIXER_FRAME_BYTES / 4)
+#define MIXER_RATE 48000u
+#define MIXER_FRAMES 48u
+#define MIXER_BYTES (MIXER_FRAMES * 4u)
+#define SOURCE_FRAMES 4096u
+#define SOURCE_MASK (SOURCE_FRAMES - 1u)
+#define COPY_FRAMES 128u
+#define MIN_SOURCE_RATE 8000u
 
+/* fill_lock guarantees at most one reader, so two bits are sufficient. */
+#define READER_ACTIVE 0x01u
+#define READER_RESETTING 0x02u
 
-/* Per-source ring, counted in 48 kHz output frames, power of two so the wrap
- * is a mask. sceAudioOutOutput blocks until the previous buffer drains, so a
- * port delivers one grain per grain-period and the ring only has to absorb
- * that burst: grain * 48000/rate output frames after resampling. 4096 covers
- * the worst realistic case (grain 1024 down to 12 kHz) and costs 16 KiB per
- * slot. Dropping it to 2048 halves that to 64 KiB total and still covers
- * every source at 24 kHz or above, which is all a PSV title realistically
- * opens; it is a one-line change if kernel memory matters more than the
- * exotic low-rate cases. */
-#define AUDIO_SOURCE_FRAMES 4096
-
-/* Staging buffer for the mono / non-48 kHz path. Only needs to be large
- * enough to amortise the ksceKernelCopyFromUserProc call overhead. */
-#define AUDIO_COPY_FRAMES 128
+#if (SOURCE_FRAMES & SOURCE_MASK) != 0
+#error SOURCE_FRAMES must be a power of two
+#endif
+#if (UAC_RESAMPLER_HISTORY & (UAC_RESAMPLER_HISTORY - 1u)) != 0
+#error UAC_RESAMPLER_HISTORY must be a power of two
+#endif
 
 typedef struct {
-	/* Shared with the lock-free consumer. read_frame and write_frame are
-	 * free-running counters, never reset backwards -- see source_drain. */
 	uint32_t read_frame;
 	uint32_t write_frame;
+	uint32_t reader_guard;
 	uint8_t enabled;
 
-	/* Producer-private: only touched while holding producer_lock. */
+	/* Protected by producer_lock. */
 	uint32_t write_cursor;
 	uint32_t write_room;
 	uint32_t rate;
 	uint32_t phase;
 	uint32_t resample_index;
 	uint32_t input_count;
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	uint32_t dropped_frames;
-#endif
 	uint32_t generation;
+	uint32_t desired_generation;
+	uint32_t epoch;
 	int mode;
+	int producer_lock;
 	uint8_t history_primed;
 
-	int producer_lock;
+#ifdef UAC_PSTV_ENABLE_LOGGING
+	uint32_t dropped_frames;
+	uint32_t copy_errors;
+	uint32_t busy_buffers;
+#endif
 } __attribute__((aligned(64))) AudioSource;
 
+typedef struct {
+	AudioSource *source;
+	const int16_t *pcm;
+	uint32_t read;
+	uint32_t take;
+} MixInput;
+
 static int mixer_active;
-static AudioSource audio_sources[UAC_AUDIO_SOURCE_SLOTS];
-static int16_t audio_pcm[UAC_AUDIO_SOURCE_SLOTS][AUDIO_SOURCE_FRAMES * 2]
+static int fill_lock;
+static uint32_t mixer_epoch;
+static AudioSource sources[UAC_AUDIO_SOURCE_SLOTS];
+static int16_t source_pcm[UAC_AUDIO_SOURCE_SLOTS][SOURCE_FRAMES * 2u]
 	__attribute__((aligned(64)));
-static int16_t input_scratch[UAC_AUDIO_SOURCE_SLOTS][AUDIO_COPY_FRAMES * 2]
+static int16_t copy_scratch[UAC_AUDIO_SOURCE_SLOTS][COPY_FRAMES * 2u]
 	__attribute__((aligned(64)));
-static int16_t resample_history[UAC_AUDIO_SOURCE_SLOTS]
-	[UAC_RESAMPLER_HISTORY * 2] __attribute__((aligned(64)));
-static int32_t mix_accumulator[MIXER_FRAMES * 2] __attribute__((aligned(64)));
+static int16_t resample_history[UAC_AUDIO_SOURCE_SLOTS][UAC_RESAMPLER_HISTORY * 2u]
+	__attribute__((aligned(64)));
+static int32_t mix_buffer[MIXER_FRAMES * 2u] __attribute__((aligned(64)));
 
 #ifdef UAC_MIXER_TEST
 void (*uac_mixer_test_before_commit)(void);
 #endif
 
-/* Non-blocking: both the producer (app thread) and the open/close paths run
- * where sleeping is not an option, so a contended source simply skips a
- * round. Acquire/release rather than __sync_*, which emits a full barrier. */
-static int try_source(AudioSource *source)
+/* Hooks and USB callbacks use try-locks only; neither path may sleep. */
+static int try_lock(int *lock)
 {
-	return __atomic_exchange_n(&source->producer_lock, 1,
-		__ATOMIC_ACQUIRE) == 0;
+	return __atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE) == 0;
 }
 
-static void unlock_source(AudioSource *source)
+static void unlock(int *lock)
 {
-	__atomic_store_n(&source->producer_lock, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(lock, 0, __ATOMIC_RELEASE);
 }
 
-/* Drop everything queued without moving the counters backwards. Zeroing them
- * would race the lock-free consumer: it samples read_frame and write_frame
- * separately, so a reset between the two loads makes the unsigned difference
- * underflow into a huge "available" and replay the whole stale ring. */
-static void source_drain(AudioSource *source)
+/* A reset blocks new leases and reclaims the ring after the current lease exits. */
+static int reader_enter(AudioSource *source)
 {
-	uint32_t write = __atomic_load_n(&source->write_frame, __ATOMIC_RELAXED);
+	uint32_t expected = 0;
 
+	return __atomic_compare_exchange_n(&source->reader_guard, &expected,
+		READER_ACTIVE, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+static int reader_leave(AudioSource *source)
+{
+	uint32_t old = __atomic_fetch_and(&source->reader_guard,
+		~READER_ACTIVE, __ATOMIC_RELEASE);
+
+	return (old & READER_RESETTING) != 0;
+}
+
+static void source_quiesce(AudioSource *source)
+{
+	__atomic_fetch_or(&source->reader_guard, READER_RESETTING, __ATOMIC_ACQ_REL);
+	__atomic_store_n(&source->enabled, 0, __ATOMIC_RELEASE);
+}
+
+static int desired_is(const AudioSource *source, uint32_t generation)
+{
+	return __atomic_load_n(&source->desired_generation, __ATOMIC_ACQUIRE) ==
+		generation;
+}
+
+/* Called with producer_lock held. Generation zero is the closed state. */
+static int source_finish_reset(AudioSource *source, uint32_t epoch,
+	uint32_t generation)
+{
+	uint32_t write;
+
+	if (__atomic_load_n(&source->reader_guard, __ATOMIC_ACQUIRE) !=
+	    READER_RESETTING || !desired_is(source, generation))
+		return 0;
+
+	write = __atomic_load_n(&source->write_frame, __ATOMIC_ACQUIRE);
 	__atomic_store_n(&source->read_frame, write, __ATOMIC_RELEASE);
 	source->write_cursor = write;
-	source->write_room = AUDIO_SOURCE_FRAMES;
+	source->write_room = SOURCE_FRAMES;
 	source->phase = 0;
 	source->resample_index = 0;
 	source->input_count = 0;
 	source->history_primed = 0;
+	source->epoch = epoch;
+
+	if (!desired_is(source, generation))
+		return 0;
+
+	__atomic_store_n(&source->enabled, generation != 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&source->reader_guard, 0, __ATOMIC_RELEASE);
+	if (!desired_is(source, generation)) {
+		source_quiesce(source);
+		return 0;
+	}
+	return 1;
 }
 
 static void source_refresh_room(AudioSource *source)
 {
-	uint32_t used = source->write_cursor -
-		__atomic_load_n(&source->read_frame, __ATOMIC_ACQUIRE);
+	uint32_t read = __atomic_load_n(&source->read_frame, __ATOMIC_ACQUIRE);
+	uint32_t used = source->write_cursor - read;
 
-	source->write_room = used < AUDIO_SOURCE_FRAMES
-		? AUDIO_SOURCE_FRAMES - used : 0;
+	source->write_room = used < SOURCE_FRAMES ? SOURCE_FRAMES - used : 0;
 }
 
-/*
- * Consumer. Runs in the USB isochronous completion callback every 1 ms, so it
- * takes no locks and touches only the free-running counters.
- */
-
-typedef struct {
-	const int16_t *pcm;
-	AudioSource *source;
-	uint32_t read;
-	uint32_t take;
-} MixInput;
-
-/* Split a ring read into the two contiguous runs it spans, so the copy and
- * accumulate loops below never mask per sample. */
-static inline void run_split(uint32_t read, uint32_t take, uint32_t *start,
-	uint32_t *first, uint32_t *second)
+static int format_supported(uint32_t rate, int mode)
 {
-	uint32_t offset = read & (AUDIO_SOURCE_FRAMES - 1u);
-	uint32_t contiguous = AUDIO_SOURCE_FRAMES - offset;
-
-	*start = offset;
-	*first = take < contiguous ? take : contiguous;
-	*second = take - *first;
+	return rate >= MIN_SOURCE_RATE && rate <= MIXER_RATE &&
+		(mode == SCE_AUDIO_OUT_MODE_MONO || mode == SCE_AUDIO_OUT_MODE_STEREO);
 }
 
-static uint32_t source_take(AudioSource *source, uint32_t *read_out)
+#ifdef UAC_PSTV_ENABLE_LOGGING
+static void note_drop(AudioSource *source, uint32_t frames)
 {
-	uint32_t read;
-	uint32_t available;
+	__atomic_fetch_add(&source->dropped_frames, frames, __ATOMIC_RELAXED);
+}
 
-	if (!__atomic_load_n(&source->enabled, __ATOMIC_RELAXED))
+static void note_copy_error(AudioSource *source)
+{
+	__atomic_fetch_add(&source->copy_errors, 1u, __ATOMIC_RELAXED);
+}
+
+static void stats_reset(void)
+{
+	uint32_t i;
+
+	for (i = 0; i < UAC_AUDIO_SOURCE_SLOTS; ++i) {
+		__atomic_store_n(&sources[i].dropped_frames, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sources[i].copy_errors, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sources[i].busy_buffers, 0, __ATOMIC_RELAXED);
+	}
+}
+
+static void stats_report(void)
+{
+	uint32_t dropped = 0, errors = 0, busy = 0, i;
+
+	for (i = 0; i < UAC_AUDIO_SOURCE_SLOTS; ++i) {
+		dropped += __atomic_load_n(&sources[i].dropped_frames, __ATOMIC_RELAXED);
+		errors += __atomic_load_n(&sources[i].copy_errors, __ATOMIC_RELAXED);
+		busy += __atomic_load_n(&sources[i].busy_buffers, __ATOMIC_RELAXED);
+	}
+	if (dropped)
+		uac_log(LOG_PREFIX "mixer: %u frames dropped (ring full)\n", dropped);
+	if (errors)
+		uac_log(LOG_PREFIX "mixer: %u user-buffer copy failures\n", errors);
+	if (busy)
+		uac_log(LOG_PREFIX "mixer: %u buffers skipped (source busy)\n", busy);
+}
+#else
+#define note_drop(source, frames) ((void)0)
+#define note_copy_error(source) ((void)0)
+#define stats_reset() ((void)0)
+#define stats_report() ((void)0)
+#endif
+
+static uint32_t source_take(AudioSource *source, uint32_t epoch,
+	uint32_t *read_out)
+{
+	uint32_t read, write, available;
+
+	if (!reader_enter(source))
 		return 0;
+	if (!__atomic_load_n(&source->enabled, __ATOMIC_ACQUIRE) ||
+	    source->epoch != epoch) {
+		reader_leave(source);
+		return 0;
+	}
+
 	read = __atomic_load_n(&source->read_frame, __ATOMIC_RELAXED);
-	available = __atomic_load_n(&source->write_frame, __ATOMIC_RELAXED) -
-		read;
-	if (available == 0)
+	write = __atomic_load_n(&source->write_frame, __ATOMIC_ACQUIRE);
+	available = write - read;
+	if (available == 0) {
+		reader_leave(source);
 		return 0;
-	/* Pairs with the release store of write_frame in uac_mixer_source_push:
-	 * the PCM behind that counter must be visible before we read it. */
-	__atomic_thread_fence(__ATOMIC_ACQUIRE);
-	if (available > AUDIO_SOURCE_FRAMES)
-		available = AUDIO_SOURCE_FRAMES;
+	}
+
 	*read_out = read;
 	return available < MIXER_FRAMES ? available : MIXER_FRAMES;
 }
 
-static void mix_store(int32_t *accumulator, const MixInput *input)
+static void ring_parts(uint32_t read, uint32_t take, uint32_t *start,
+	uint32_t *first)
 {
-	uint32_t start;
-	uint32_t first;
-	uint32_t second;
-	uint32_t index;
-	const int16_t *pcm;
-
-	run_split(input->read, input->take, &start, &first, &second);
-	pcm = input->pcm + start * 2u;
-	for (index = 0; index < first * 2u; ++index)
-		accumulator[index] = pcm[index];
-	pcm = input->pcm;
-	for (index = 0; index < second * 2u; ++index)
-		accumulator[first * 2u + index] = pcm[index];
+	*start = read & SOURCE_MASK;
+	*first = take < SOURCE_FRAMES - *start ? take : SOURCE_FRAMES - *start;
 }
 
-static void mix_add(int32_t *accumulator, const MixInput *input)
+static void mix_samples(int32_t *dst, const int16_t *src, uint32_t count,
+	int add)
 {
-	uint32_t start;
-	uint32_t first;
-	uint32_t second;
-	uint32_t index;
-	const int16_t *pcm;
+	uint32_t i;
 
-	run_split(input->read, input->take, &start, &first, &second);
-	pcm = input->pcm + start * 2u;
-	for (index = 0; index < first * 2u; ++index)
-		accumulator[index] += pcm[index];
-	pcm = input->pcm;
-	for (index = 0; index < second * 2u; ++index)
-		accumulator[first * 2u + index] += pcm[index];
+	if (add) {
+		for (i = 0; i < count; ++i)
+			dst[i] += src[i];
+	} else {
+		for (i = 0; i < count; ++i)
+			dst[i] = src[i];
+	}
 }
 
-/* Single-source fast path: the ring already holds finished 16-bit stereo, so
- * it goes straight out with no accumulate and no saturation. */
-static void mix_copy(int16_t *output, const MixInput *input)
+static void mix_ring(int32_t *dst, const MixInput *input, int add)
 {
-	uint32_t start;
-	uint32_t first;
-	uint32_t second;
+	uint32_t start, first, second;
 
-	run_split(input->read, input->take, &start, &first, &second);
-	memcpy(output, input->pcm + start * 2u, first * 4u);
-	if (second != 0)
-		memcpy(output + first * 2u, input->pcm, second * 4u);
+	ring_parts(input->read, input->take, &start, &first);
+	second = input->take - first;
+	mix_samples(dst, input->pcm + start * 2u, first * 2u, add);
+	if (second)
+		mix_samples(dst + first * 2u, input->pcm, second * 2u, add);
+}
+
+static void copy_ring(int16_t *dst, const MixInput *input)
+{
+	uint32_t start, first, second;
+
+	ring_parts(input->read, input->take, &start, &first);
+	second = input->take - first;
+	memcpy(dst, input->pcm + start * 2u, first * 4u);
+	if (second)
+		memcpy(dst + first * 2u, input->pcm, second * 4u);
 }
 
 void uac_mixer_fill(int16_t *output)
 {
 	MixInput inputs[UAC_AUDIO_SOURCE_SLOTS];
-	uint32_t count = 0;
-	uint32_t longest = 0;
-	uint32_t index;
-	int drained = 0;
+	uint32_t epoch, count = 0, longest = 0, i;
+	int reset_raced = 0;
 
-	for (index = 0; index < UAC_AUDIO_SOURCE_SLOTS; ++index) {
-		AudioSource *source = &audio_sources[index];
-		uint32_t read = 0;
-		uint32_t take = source_take(source, &read);
-
-		if (take == 0)
-			continue;
-		inputs[count].pcm = audio_pcm[index];
-		inputs[count].source = source;
-		inputs[count].read = read;
-		inputs[count].take = take;
-		if (take > longest)
-			longest = take;
-		++count;
-	}
-
-	if (count == 0) {
-		memset(output, 0, MIXER_FRAME_BYTES);
+	if (!try_lock(&fill_lock)) {
+		memset(output, 0, MIXER_BYTES);
 		return;
 	}
+	if (!__atomic_load_n(&mixer_active, __ATOMIC_ACQUIRE))
+		goto silence;
+
+	epoch = __atomic_load_n(&mixer_epoch, __ATOMIC_ACQUIRE);
+	for (i = 0; i < UAC_AUDIO_SOURCE_SLOTS; ++i) {
+		uint32_t read, take = source_take(&sources[i], epoch, &read);
+
+		if (!take)
+			continue;
+		inputs[count] = (MixInput){&sources[i], source_pcm[i], read, take};
+		if (take > longest)
+			longest = take;
+		count++;
+	}
+	if (!count)
+		goto silence;
 
 	if (count == 1) {
-		mix_copy(output, &inputs[0]);
+		copy_ring(output, &inputs[0]);
 	} else {
 		uint32_t sample;
 
-		mix_store(mix_accumulator, &inputs[0]);
-		for (sample = inputs[0].take * 2u; sample < longest * 2u; ++sample)
-			mix_accumulator[sample] = 0;
-		for (index = 1; index < count; ++index)
-			mix_add(mix_accumulator, &inputs[index]);
-		/* Compiles to SSAT on Cortex-A9. */
+		mix_ring(mix_buffer, &inputs[0], 0);
+		memset(mix_buffer + inputs[0].take * 2u, 0,
+			(longest - inputs[0].take) * 2u * sizeof(mix_buffer[0]));
+		for (i = 1; i < count; ++i)
+			mix_ring(mix_buffer, &inputs[i], 1);
 		for (sample = 0; sample < longest * 2u; ++sample) {
-			int32_t mixed = mix_accumulator[sample];
+			int32_t mixed = mix_buffer[sample];
+
 			if (mixed > 32767)
 				mixed = 32767;
 			else if (mixed < -32768)
@@ -250,102 +323,77 @@ void uac_mixer_fill(int16_t *output)
 			output[sample] = (int16_t)mixed;
 		}
 	}
-
-	/* Sources that ran short contribute silence for the remainder. */
 	if (longest < MIXER_FRAMES)
 		memset(output + longest * 2u, 0, (MIXER_FRAMES - longest) * 4u);
 
 #ifdef UAC_MIXER_TEST
-	if (uac_mixer_test_before_commit != NULL)
+	if (uac_mixer_test_before_commit)
 		uac_mixer_test_before_commit();
 #endif
 
-	for (index = 0; index < count; ++index) {
-		uint32_t expected = inputs[index].read;
-
-		/* Do not undo a close/reopen drain that advanced read_frame after
-		 * source_take() sampled it. The drain wins when this CAS fails. */
-		if (!__atomic_compare_exchange_n(&inputs[index].source->read_frame,
-			&expected, inputs[index].read + inputs[index].take, 0,
-			__ATOMIC_RELEASE, __ATOMIC_RELAXED))
-			drained = 1;
+	for (i = 0; i < count; ++i) {
+		__atomic_store_n(&inputs[i].source->read_frame,
+			inputs[i].read + inputs[i].take, __ATOMIC_RELEASE);
+		reset_raced |= reader_leave(inputs[i].source);
 	}
-	/* A reopened producer may already be reusing its ring. Suppress this one
-	 * transitional packet rather than sending a stale or partially replaced
-	 * frame; successful sources remain consumed, so nothing is replayed. */
-	if (drained)
-		memset(output, 0, MIXER_FRAME_BYTES);
+	if (reset_raced)
+		memset(output, 0, MIXER_BYTES);
+	unlock(&fill_lock);
+	return;
+
+silence:
+	memset(output, 0, MIXER_BYTES);
+	unlock(&fill_lock);
 }
 
 void uac_mixer_start(void)
 {
-	int index;
-
-	for (index = 0; index < UAC_AUDIO_SOURCE_SLOTS; ++index) {
-		AudioSource *source = &audio_sources[index];
-		if (try_source(source)) {
-			source_drain(source);
-#ifdef UAC_PSTV_ENABLE_LOGGING
-			source->dropped_frames = 0;
-#endif
-			unlock_source(source);
-		}
-	}
+	__atomic_store_n(&mixer_active, 0, __ATOMIC_RELEASE);
+	__atomic_add_fetch(&mixer_epoch, 1u, __ATOMIC_ACQ_REL);
+	stats_reset();
 	__atomic_store_n(&mixer_active, 1, __ATOMIC_RELEASE);
 	uac_log(LOG_PREFIX "mixer: %u sources x %u frames, %u frames/packet\n",
-		UAC_AUDIO_SOURCE_SLOTS, AUDIO_SOURCE_FRAMES, MIXER_FRAMES);
+		UAC_AUDIO_SOURCE_SLOTS, SOURCE_FRAMES, MIXER_FRAMES);
 }
 
 void uac_mixer_stop(void)
 {
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	uint32_t dropped = 0;
-	int index;
-#endif
-
 	__atomic_store_n(&mixer_active, 0, __ATOMIC_RELEASE);
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	for (index = 0; index < UAC_AUDIO_SOURCE_SLOTS; ++index)
-		dropped += audio_sources[index].dropped_frames;
-	if (dropped != 0)
-		uac_log(LOG_PREFIX "mixer: %u frames dropped (ring overrun)\n",
-			dropped);
-#endif
-}
-
-/*
- * Producer.
- */
-
-static int supported_rate(uint32_t rate)
-{
-	return rate == 8000 || rate == 11025 || rate == 12000 || rate == 16000 ||
-		rate == 22050 || rate == 24000 || rate == 32000 ||
-		rate == 44100 || rate == 48000;
+	__atomic_add_fetch(&mixer_epoch, 1u, __ATOMIC_ACQ_REL);
+	stats_report();
 }
 
 int uac_mixer_source_open(int source, uint32_t rate, int mode,
 	uint32_t generation)
 {
 	AudioSource *state;
+	int accepted;
 
 	if (source < 0 || source >= UAC_AUDIO_SOURCE_SLOTS)
 		return -1;
-	state = &audio_sources[source];
-	/* Stop the consumer before trying to drain. If a producer owns the
-	 * slot, the caller leaves its port unpublished and retries later. */
-	__atomic_store_n(&state->enabled, 0, __ATOMIC_RELEASE);
-	if (!try_source(state))
+
+	state = &sources[source];
+	__atomic_store_n(&state->desired_generation, 0, __ATOMIC_RELEASE);
+	source_quiesce(state);
+	if (!generation || !format_supported(rate, mode)) {
+		uac_log(LOG_PREFIX
+			"mixer: reject source %d format %u Hz mode %d gen %u\n",
+			source, rate, mode, generation);
 		return -1;
-	source_drain(state);
+	}
+	if (!try_lock(&state->producer_lock))
+		return -1;
+
 	state->rate = rate;
 	state->mode = mode;
 	state->generation = generation;
-	__atomic_store_n(&state->enabled, supported_rate(rate) &&
-		(mode == SCE_AUDIO_OUT_MODE_MONO ||
-		 mode == SCE_AUDIO_OUT_MODE_STEREO), __ATOMIC_RELEASE);
-	unlock_source(state);
-	return 0;
+	__atomic_store_n(&state->desired_generation, generation, __ATOMIC_RELEASE);
+	source_finish_reset(state,
+		__atomic_load_n(&mixer_epoch, __ATOMIC_ACQUIRE), generation);
+	/* A live reader may defer reset until the first push; supersession may not. */
+	accepted = desired_is(state, generation);
+	unlock(&state->producer_lock);
+	return accepted ? 0 : -1;
 }
 
 void uac_mixer_source_close(int source)
@@ -354,46 +402,72 @@ void uac_mixer_source_close(int source)
 
 	if (source < 0 || source >= UAC_AUDIO_SOURCE_SLOTS)
 		return;
-	state = &audio_sources[source];
-	__atomic_store_n(&state->enabled, 0, __ATOMIC_RELEASE);
-	if (!try_source(state))
+	state = &sources[source];
+	__atomic_store_n(&state->desired_generation, 0, __ATOMIC_RELEASE);
+	source_quiesce(state);
+	if (!try_lock(&state->producer_lock))
 		return;
-	source_drain(state);
-	unlock_source(state);
+
+	state->rate = 0;
+	state->mode = 0;
+	state->generation = 0;
+	source_finish_reset(state,
+		__atomic_load_n(&mixer_epoch, __ATOMIC_ACQUIRE), 0);
+	unlock(&state->producer_lock);
 }
 
-static inline void source_write_frame(AudioSource *source, int16_t *pcm,
+static int source_prepare_push(AudioSource *source, uint32_t generation,
+	uint32_t epoch)
+{
+	uint32_t guard;
+
+	if (!desired_is(source, generation))
+		return 0;
+	guard = __atomic_load_n(&source->reader_guard, __ATOMIC_ACQUIRE);
+	if ((guard & READER_RESETTING) &&
+	    !source_finish_reset(source, epoch, generation))
+		return 0;
+	if (!__atomic_load_n(&source->enabled, __ATOMIC_ACQUIRE) ||
+	    source->generation != generation)
+		return 0;
+	if (source->epoch != epoch) {
+		source_quiesce(source);
+		if (!source_finish_reset(source, epoch, generation))
+			return 0;
+	}
+	return desired_is(source, generation) &&
+		__atomic_load_n(&source->enabled, __ATOMIC_ACQUIRE) &&
+		source->generation == generation;
+}
+
+static void source_write_frame(AudioSource *source, int16_t *pcm,
 	int16_t left, int16_t right)
 {
-	uint32_t ring_frame;
+	uint32_t frame;
 
-	if (source->write_room == 0) {
-		/* The consumer may have drained since we last looked. */
+	if (!source->write_room) {
 		source_refresh_room(source);
-		if (source->write_room == 0) {
-#ifdef UAC_PSTV_ENABLE_LOGGING
-			source->dropped_frames++;
-#endif
+		if (!source->write_room) {
+			note_drop(source, 1);
 			return;
 		}
 	}
-	ring_frame = source->write_cursor & (AUDIO_SOURCE_FRAMES - 1u);
-	pcm[ring_frame * 2u] = left;
-	pcm[ring_frame * 2u + 1u] = right;
+	frame = source->write_cursor & SOURCE_MASK;
+	pcm[frame * 2u] = left;
+	pcm[frame * 2u + 1u] = right;
 	source->write_cursor++;
 	source->write_room--;
 }
 
-static uint32_t source_copy_native(AudioSource *source, int16_t *pcm,
-	SceUID pid, const int16_t *input, uint32_t frames)
+static void source_copy_native(AudioSource *source, int16_t *pcm, SceUID pid,
+	const int16_t *input, uint32_t frames)
 {
 	uint32_t copied = 0;
 
 	while (copied < frames) {
-		uint32_t ring_frame = source->write_cursor &
-			(AUDIO_SOURCE_FRAMES - 1u);
-		uint32_t contiguous = AUDIO_SOURCE_FRAMES - ring_frame;
+		uint32_t frame = source->write_cursor & SOURCE_MASK;
 		uint32_t chunk = frames - copied;
+		uint32_t contiguous = SOURCE_FRAMES - frame;
 
 		if (chunk > contiguous)
 			chunk = contiguous;
@@ -402,47 +476,42 @@ static uint32_t source_copy_native(AudioSource *source, int16_t *pcm,
 			if (chunk > source->write_room)
 				chunk = source->write_room;
 		}
-		if (chunk == 0) {
-#ifdef UAC_PSTV_ENABLE_LOGGING
-			source->dropped_frames += frames - copied;
-#endif
-			return frames;
+		if (!chunk) {
+			note_drop(source, frames - copied);
+			return;
 		}
-		if (ksceKernelCopyFromUserProc(pid, pcm + ring_frame * 2u,
-			input + copied * 2u, chunk * 4u) < 0)
-			break;
+		if (ksceKernelCopyFromUserProc(pid, pcm + frame * 2u,
+			input + copied * 2u, chunk * 4u) < 0) {
+			note_copy_error(source);
+			return;
+		}
 		source->write_cursor += chunk;
 		source->write_room -= chunk;
 		copied += chunk;
 	}
-	return copied;
 }
 
-static inline const int16_t *resampler_row(uint32_t phase, int *step)
+static const int16_t *resampler_row(uint32_t phase, int *step)
 {
 	if (phase <= UAC_RESAMPLER_PHASES / 2u) {
 		*step = 1;
-		return &uac_resampler_coefficients[phase][0];
+		return uac_resampler_coefficients[phase];
 	}
 	*step = -1;
 	return &uac_resampler_coefficients[UAC_RESAMPLER_PHASES - phase]
-		[UAC_RESAMPLER_TAPS - 1];
+		[UAC_RESAMPLER_TAPS - 1u];
 }
 
-static inline int16_t resampler_round(int32_t value)
+static int16_t resampler_round(int32_t value)
 {
-	int32_t sample;
+	int32_t half = 1 << (UAC_RESAMPLER_SHIFT - 1);
+	int32_t sample = value >= 0 ? (value + half) >> UAC_RESAMPLER_SHIFT
+		: -((-value + half) >> UAC_RESAMPLER_SHIFT);
 
-	if (value >= 0)
-		sample = (value + (1 << (UAC_RESAMPLER_SHIFT - 1))) >>
-			UAC_RESAMPLER_SHIFT;
-	else
-		sample = -((-value + (1 << (UAC_RESAMPLER_SHIFT - 1))) >>
-			UAC_RESAMPLER_SHIFT);
 	if (sample > 32767)
-		sample = 32767;
-	else if (sample < -32768)
-		sample = -32768;
+		return 32767;
+	if (sample < -32768)
+		return -32768;
 	return (int16_t)sample;
 }
 
@@ -450,55 +519,49 @@ static void source_resampler_output(AudioSource *source, int16_t *pcm,
 	const int16_t *history)
 {
 	uint32_t scaled = source->phase * UAC_RESAMPLER_PHASES;
-	uint32_t coefficient_phase = scaled / 48000u;
-	uint32_t remainder = scaled - coefficient_phase * 48000u;
-	const int16_t *row0;
-	const int16_t *row1 = NULL;
-	uint32_t blend = 0;
-	int step0;
-	int step1 = 0;
-	int32_t left = 0;
-	int32_t right = 0;
-	uint32_t tap;
+	uint32_t phase = scaled / MIXER_RATE;
+	uint32_t remainder = scaled - phase * MIXER_RATE;
+	const int16_t *row0, *row1 = NULL;
+	uint32_t blend = 0, tap;
+	int step0, step1 = 0;
+	int32_t left = 0, right = 0;
 
-	if (source->write_room == 0) {
+	if (!source->write_room) {
 		source_refresh_room(source);
-		if (source->write_room == 0) {
-#ifdef UAC_PSTV_ENABLE_LOGGING
-			source->dropped_frames++;
-#endif
+		if (!source->write_room) {
+			note_drop(source, 1);
 			goto advance;
 		}
 	}
-	row0 = resampler_row(coefficient_phase, &step0);
-	if (remainder != 0) {
-		row1 = resampler_row(coefficient_phase + 1u, &step1);
-		blend = (remainder * 65536u + 24000u) / 48000u;
+
+	row0 = resampler_row(phase, &step0);
+	if (remainder) {
+		row1 = resampler_row(phase + 1u, &step1);
+		blend = (remainder * 65536u + MIXER_RATE / 2u) / MIXER_RATE;
 	}
 	for (tap = 0; tap < UAC_RESAMPLER_TAPS; ++tap) {
-		uint32_t frame = (source->resample_index + tap -
-			UAC_RESAMPLER_LEFT) & (UAC_RESAMPLER_HISTORY - 1u);
+		uint32_t frame = (source->resample_index + tap - UAC_RESAMPLER_LEFT) &
+			(UAC_RESAMPLER_HISTORY - 1u);
 		int32_t coefficient = row0[(int)tap * step0];
 
-		if (remainder != 0) {
+		if (remainder) {
 			int32_t next = row1[(int)tap * step1];
 			coefficient += ((next - coefficient) * (int32_t)blend) >> 16;
 		}
 		left += history[frame * 2u] * coefficient;
 		right += history[frame * 2u + 1u] * coefficient;
 	}
-	source_write_frame(source, pcm, resampler_round(left),
-		resampler_round(right));
+	source_write_frame(source, pcm, resampler_round(left), resampler_round(right));
 
 advance:
 	source->phase += source->rate;
-	if (source->phase >= 48000u) {
-		source->phase -= 48000u;
+	if (source->phase >= MIXER_RATE) {
+		source->phase -= MIXER_RATE;
 		source->resample_index++;
 	}
 }
 
-static inline void source_resample_frame(AudioSource *source, int16_t *pcm,
+static void source_resample_frame(AudioSource *source, int16_t *pcm,
 	int16_t *history, int16_t left, int16_t right)
 {
 	uint32_t frame;
@@ -517,67 +580,76 @@ static inline void source_resample_frame(AudioSource *source, int16_t *pcm,
 	history[frame * 2u + 1u] = right;
 	source->input_count++;
 	while ((uint32_t)(source->input_count - source->resample_index) >
-		UAC_RESAMPLER_RIGHT)
+	       UAC_RESAMPLER_RIGHT)
 		source_resampler_output(source, pcm, history);
+}
+
+static void source_copy_converted(AudioSource *source, int16_t *pcm,
+	int16_t *history, int16_t *scratch, SceUID pid, const int16_t *input,
+	uint32_t frames, uint32_t channels)
+{
+	uint32_t copied = 0;
+
+	while (copied < frames) {
+		uint32_t chunk = frames - copied;
+		uint32_t frame;
+
+		if (chunk > COPY_FRAMES)
+			chunk = COPY_FRAMES;
+		if (ksceKernelCopyFromUserProc(pid, scratch, input + copied * channels,
+			chunk * channels * sizeof(*scratch)) < 0) {
+			note_copy_error(source);
+			return;
+		}
+		if (source->rate == MIXER_RATE) {
+			for (frame = 0; frame < chunk; ++frame)
+				source_write_frame(source, pcm, scratch[frame], scratch[frame]);
+		} else {
+			for (frame = 0; frame < chunk; ++frame) {
+				int16_t left = scratch[frame * channels];
+				int16_t right = channels == 1u ? left
+					: scratch[frame * channels + 1u];
+				source_resample_frame(source, pcm, history, left, right);
+			}
+		}
+		copied += chunk;
+	}
 }
 
 void uac_mixer_source_push(int source, int pid, const void *buffer,
 	uint32_t frames, uint32_t generation)
 {
 	AudioSource *state;
-	int16_t *pcm;
-	int16_t *history;
-	uint32_t rate;
-	uint32_t channels;
-	uint32_t copied = 0;
-	int16_t *scratch;
+	uint32_t epoch, channels;
 
-	if (source < 0 || source >= UAC_AUDIO_SOURCE_SLOTS || buffer == NULL ||
-		frames == 0 || !__atomic_load_n(&mixer_active, __ATOMIC_ACQUIRE))
+	if (source < 0 || source >= UAC_AUDIO_SOURCE_SLOTS || !buffer || !frames ||
+	    !__atomic_load_n(&mixer_active, __ATOMIC_ACQUIRE))
 		return;
-	state = &audio_sources[source];
-	pcm = audio_pcm[source];
-	history = resample_history[source];
-	scratch = input_scratch[source];
-	if (!try_source(state))
+
+	state = &sources[source];
+	epoch = __atomic_load_n(&mixer_epoch, __ATOMIC_ACQUIRE);
+	if (!try_lock(&state->producer_lock)) {
+#ifdef UAC_PSTV_ENABLE_LOGGING
+		__atomic_fetch_add(&state->busy_buffers, 1u, __ATOMIC_RELAXED);
+#endif
 		return;
-	if (!__atomic_load_n(&state->enabled, __ATOMIC_RELAXED) ||
-		state->generation != generation)
-		goto done;
-	rate = state->rate;
-	channels = state->mode == SCE_AUDIO_OUT_MODE_MONO ? 1u : 2u;
-	state->write_cursor = __atomic_load_n(&state->write_frame,
-		__ATOMIC_RELAXED);
-	source_refresh_room(state);
-
-	if (rate == 48000u && channels == 2u) {
-		/* Already in output format: straight into the ring. */
-		copied = source_copy_native(state, pcm, pid, buffer, frames);
-	} else while (copied < frames) {
-		uint32_t chunk = frames - copied;
-		uint32_t frame;
-
-		if (chunk > AUDIO_COPY_FRAMES)
-			chunk = AUDIO_COPY_FRAMES;
-		if (ksceKernelCopyFromUserProc(pid, scratch,
-			(const int16_t *)buffer + copied * channels,
-			chunk * channels * sizeof(scratch[0])) < 0)
-			break;
-		if (rate == 48000u)
-			for (frame = 0; frame < chunk; ++frame)
-				source_write_frame(state, pcm, scratch[frame],
-					scratch[frame]);
-		else
-			for (frame = 0; frame < chunk; ++frame) {
-				int16_t left = scratch[frame * channels];
-				int16_t right = channels == 1u
-					? left : scratch[frame * channels + 1u];
-				source_resample_frame(state, pcm, history, left, right);
-			}
-		copied += chunk;
 	}
-	__atomic_store_n(&state->write_frame, state->write_cursor,
-		__ATOMIC_RELEASE);
-done:
-	unlock_source(state);
+	if (!__atomic_load_n(&mixer_active, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&mixer_epoch, __ATOMIC_ACQUIRE) != epoch ||
+	    !source_prepare_push(state, generation, epoch))
+		goto out;
+
+	channels = state->mode == SCE_AUDIO_OUT_MODE_MONO ? 1u : 2u;
+	state->write_cursor = __atomic_load_n(&state->write_frame, __ATOMIC_RELAXED);
+	source_refresh_room(state);
+	if (state->rate == MIXER_RATE && channels == 2u) {
+		source_copy_native(state, source_pcm[source], (SceUID)pid, buffer, frames);
+	} else {
+		source_copy_converted(state, source_pcm[source], resample_history[source],
+			copy_scratch[source], (SceUID)pid, buffer, frames, channels);
+	}
+	__atomic_store_n(&state->write_frame, state->write_cursor, __ATOMIC_RELEASE);
+
+out:
+	unlock(&state->producer_lock);
 }

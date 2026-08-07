@@ -17,7 +17,7 @@ option(UAC_PSTV_ENABLE_LOGGING
 
 add_executable(uac_pstv_kernel
   src/main.c
-  src/audio.c
+  src/audio_hooks.c
   src/mixer.c
   src/stream.c
   src/uac1.c
@@ -53,9 +53,9 @@ if(UAC_PSTV_ENABLE_LOGGING)
 endif()
 
 set_target_properties(uac_pstv_kernel PROPERTIES LINK_FLAGS "-nostdlib")
-
 set(VITA_ELF_CREATE_FLAGS "" CACHE STRING "vita-elf-create flags" FORCE)
 set(VITA_MAKE_FSELF_FLAGS "" CACHE STRING "vita-make-fself flags" FORCE)
+
 vita_create_self(uac_pstv.skprx uac_pstv_kernel
   CONFIG ${CMAKE_SOURCE_DIR}/uac_pstv.yml
   UNSAFE

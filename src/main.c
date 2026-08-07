@@ -1,7 +1,6 @@
-#include "audio.h"
+#include "audio_hooks.h"
 #include "log.h"
 #include "mixer.h"
-#include "stream.h"
 #include "uac1.h"
 
 #include <psp2kern/kernel/modulemgr.h>
@@ -20,6 +19,7 @@ static const SceUsbdDriver uac_driver = {
 	.attach = uac1_attach,
 	.detach = uac1_detach,
 };
+
 static int register_usb_driver(void)
 {
 	int result = ksceUsbdRegisterDriver(&uac_driver);
@@ -36,6 +36,7 @@ static int unregister_usb_driver(void)
 
 	if (!owns_usb_driver)
 		return 0;
+
 	result = ksceUsbdUnregisterDriver(&uac_driver);
 	uac_log(LOG_PREFIX "USB unregister: 0x%08x\n", result);
 	if (result >= 0)
@@ -46,6 +47,7 @@ static int unregister_usb_driver(void)
 static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
 {
 	int result;
+
 	(void)eventid;
 	(void)args;
 	(void)opt;
@@ -61,31 +63,36 @@ static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
 int module_start(SceSize args, const void *argp)
 {
 	int result;
+
 	(void)args;
 	(void)argp;
 
 	result = ksceUsbServMacSelect(2, 0);
 	if (result < 0)
 		return SCE_KERNEL_START_FAILED;
+
 	if (register_usb_driver() < 0)
 		return SCE_KERNEL_START_FAILED;
 
-	result = uac_audio_init();
+	result = uac_audio_hooks_init();
 	if (result < 0) {
-		uac_audio_fini();
+		(void)uac_audio_hooks_fini();
 		(void)unregister_usb_driver();
 		return SCE_KERNEL_START_FAILED;
 	}
+
 	started = 1;
-	result = ksceKernelRegisterSysEventHandler("uac_pstv_sysevent",
-		uac_sysevent_handler, NULL);
+	result = ksceKernelRegisterSysEventHandler(
+		"uac_pstv_sysevent", uac_sysevent_handler, NULL);
 	uac_log(LOG_PREFIX "sysevent register: 0x%08x\n", result);
+
 	return SCE_KERNEL_START_SUCCESS;
 }
 
 int module_stop(SceSize args, const void *argp)
 {
 	int result;
+
 	(void)args;
 	(void)argp;
 
@@ -95,8 +102,12 @@ int module_stop(SceSize args, const void *argp)
 		started = 1;
 		return SCE_KERNEL_STOP_FAIL;
 	}
+
 	uac_mixer_stop();
-	uac_audio_fini();
+	result = uac_audio_hooks_fini();
+	if (result < 0)
+		return SCE_KERNEL_STOP_FAIL;
+
 	return SCE_KERNEL_STOP_SUCCESS;
 }
 

@@ -2,150 +2,140 @@
 #include "log.h"
 #include "mixer.h"
 
-#include <psp2kern/usbd.h>
 #include <psp2kern/kernel/cpu/cache.h>
 #include <psp2kern/kernel/threadmgr.h>
+#include <psp2kern/usbd.h>
+#include <stdint.h>
 #include <string.h>
 
 #define LOG_PREFIX "[uac-pstv] "
+#define PACKET_BYTES 192u
+#define STOP_POLL_US 1000u
+#define STOP_POLLS 50u
 
-/* One UAC1 OUT packet: 48 stereo 16-bit frames, 1 ms at 48 kHz. */
-#define STREAM_BUFFER_BYTES 192
-
-/* uac_stream_stop waits this long for an in-flight completion callback to
- * retire before the caller closes the pipe underneath it. */
-#define STREAM_STOP_POLL_US 1000
-#define STREAM_STOP_POLLS 20
+enum { STREAM_IDLE, STREAM_STARTING, STREAM_RUNNING, STREAM_STOPPING };
 
 typedef struct {
-	int16_t buffer[STREAM_BUFFER_BYTES / sizeof(int16_t)]
-		__attribute__((aligned(64)));
+	int16_t buffer[PACKET_BYTES / sizeof(int16_t)] __attribute__((aligned(64)));
 	ksceUsbdIsochTransfer transfer __attribute__((aligned(64)));
 } StreamRequest;
 
-/* SceUsbd accepts one isochronous request per pipe. */
 static StreamRequest stream_request __attribute__((aligned(64)));
-static int stream_running;
-static int stream_pipe;
-static uint32_t callback_active;
-#ifdef UAC_PSTV_ENABLE_LOGGING
-static int stream_error;
-#endif
+static int stream_state;
+static int stream_pipe = -1;
 
-static void fill_audio(int16_t *output)
+/* IDLE means the static request is safe to initialize for another stream. */
+static void retire_stream(int result, uint8_t psw)
 {
-	uac_mixer_fill(output);
+	int previous = __atomic_exchange_n(&stream_state, STREAM_STOPPING,
+		__ATOMIC_ACQ_REL);
+
+	if (previous == STREAM_RUNNING)
+		uac_mixer_stop();
+	if (result < 0)
+		uac_log(LOG_PREFIX "stream transfer failed: 0x%08x\n", result);
+	else if (psw != USBD_CC_NOERR)
+		uac_log(LOG_PREFIX "stream packet failed: PSW 0x%02x\n", psw);
+	stream_pipe = -1;
+	__atomic_store_n(&stream_state, STREAM_IDLE, __ATOMIC_RELEASE);
 }
 
-static void prepare_request(StreamRequest *request)
+static void transfer_done(int32_t result, ksceUsbdIsochTransfer *transfer,
+	void *arg);
+
+/* Returns 0 when queued, 1 when stopping, or the USB submission error. */
+static int queue_request(StreamRequest *request)
 {
-	request->transfer.packets[0].len = STREAM_BUFFER_BYTES;
+	request->transfer.packets[0].len = PACKET_BYTES;
 	request->transfer.packets[0].PSW = 0;
+	uac_mixer_fill(request->buffer);
+	ksceKernelDcacheCleanRange(request->buffer, PACKET_BYTES);
+	if (__atomic_load_n(&stream_state, __ATOMIC_ACQUIRE) != STREAM_RUNNING)
+		return 1;
+	request->transfer.relative_start_frame = 1;
+	return ksceUsbdIsochronousTransfer(stream_pipe, &request->transfer,
+		transfer_done, request);
 }
 
-static void transfer_done(int32_t result, ksceUsbdIsochTransfer *request,
+static void transfer_done(int32_t result, ksceUsbdIsochTransfer *transfer,
 	void *arg)
 {
-	StreamRequest *slot = (StreamRequest *)arg;
-	int submit;
-	(void)request;
+	uint8_t psw = transfer->packets[0].PSW;
 
-	__atomic_fetch_add(&callback_active, 1, __ATOMIC_ACQUIRE);
-	if (result < 0) {
-#ifdef UAC_PSTV_ENABLE_LOGGING
-		__atomic_store_n(&stream_error, result, __ATOMIC_RELEASE);
-#endif
-		__atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
-		uac_mixer_stop();
-		goto done;
+	if (result < 0 || psw != USBD_CC_NOERR) {
+		retire_stream(result, psw);
+		return;
 	}
-	if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE))
-		goto done;
-	prepare_request(slot);
-	fill_audio(slot->buffer);
-	ksceKernelDcacheCleanRange(slot->buffer, STREAM_BUFFER_BYTES);
-	if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE))
-		goto done;
-	/* Frame zero is rejected; frame one schedules the next request. */
-	slot->transfer.relative_start_frame = 1;
-	submit = ksceUsbdIsochronousTransfer(
-		__atomic_load_n(&stream_pipe, __ATOMIC_RELAXED), &slot->transfer,
-		transfer_done, slot);
-	if (submit < 0) {
-#ifdef UAC_PSTV_ENABLE_LOGGING
-		__atomic_store_n(&stream_error, submit, __ATOMIC_RELEASE);
-#endif
-		__atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
-		uac_mixer_stop();
+	if (__atomic_load_n(&stream_state, __ATOMIC_ACQUIRE) != STREAM_RUNNING) {
+		retire_stream(0, USBD_CC_NOERR);
+		return;
 	}
-done:
-	__atomic_fetch_sub(&callback_active, 1, __ATOMIC_RELEASE);
+	result = queue_request(arg);
+	if (result != 0)
+		retire_stream(result < 0 ? result : 0, USBD_CC_NOERR);
 }
 
-int uac_stream_start(int pipe_id, uint16_t packet_bytes, uint8_t speed,
-	uint8_t interval)
+int uac_stream_start(int pipe_id)
 {
+	int expected = STREAM_IDLE;
 	int result;
 
-	if (__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE) ||
-		packet_bytes != STREAM_BUFFER_BYTES)
-		return -1;
-	if (speed == SCE_USBD_DEVICE_SPEED_HS) {
-		if (interval != 4)
-			return -1;
-	} else if (speed != SCE_USBD_DEVICE_SPEED_FS || interval != 1)
+	if (pipe_id < 0 || !__atomic_compare_exchange_n(&stream_state, &expected,
+		STREAM_STARTING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 		return -1;
 
-	__atomic_store_n(&stream_pipe, pipe_id, __ATOMIC_RELAXED);
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	__atomic_store_n(&stream_error, 0, __ATOMIC_RELEASE);
-#endif
-	__atomic_store_n(&stream_running, 1, __ATOMIC_RELEASE);
-	uac_mixer_start();
+	stream_pipe = pipe_id;
 	memset(&stream_request, 0, sizeof(stream_request));
 	stream_request.transfer.buffer_base = stream_request.buffer;
-	stream_request.transfer.relative_start_frame = 1;
-	/* This field is the OUT byte count, despite VitaSDK's guessed name. */
-	stream_request.transfer.num_packets = STREAM_BUFFER_BYTES;
-	prepare_request(&stream_request);
-	fill_audio(stream_request.buffer);
-	ksceKernelDcacheCleanRange(stream_request.buffer, STREAM_BUFFER_BYTES);
-	result = ksceUsbdIsochronousTransfer(pipe_id, &stream_request.transfer,
-		transfer_done, &stream_request);
-	if (result < 0) {
-		__atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
+	/* On PSTV this is the OUT byte count, despite its VitaSDK name. */
+	stream_request.transfer.num_packets = PACKET_BYTES;
+	uac_mixer_start();
+
+	expected = STREAM_STARTING;
+	if (!__atomic_compare_exchange_n(&stream_state, &expected, STREAM_RUNNING,
+		0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
 		uac_mixer_stop();
-		uac_log(LOG_PREFIX "stream queue failed: 0x%08x\n", result);
-		return result;
+		stream_pipe = -1;
+		__atomic_store_n(&stream_state, STREAM_IDLE, __ATOMIC_RELEASE);
+		return -1;
 	}
-	uac_log(LOG_PREFIX "stream queued: %d-byte OUT request\n",
-		STREAM_BUFFER_BYTES);
+
+	result = queue_request(&stream_request);
+	if (result != 0) {
+		retire_stream(result < 0 ? result : 0, USBD_CC_NOERR);
+		return result < 0 ? result : -1;
+	}
+	uac_log(LOG_PREFIX "stream queued: %u-byte OUT request\n", PACKET_BYTES);
 	return 0;
 }
 
 void uac_stream_stop(void)
 {
-	int wait;
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	int error;
-#endif
-	int was_running;
+	int state;
+	int expected;
+	uint32_t wait;
 
-	was_running = __atomic_exchange_n(&stream_running, 0,
-		__ATOMIC_ACQ_REL);
-	if (was_running)
-		uac_mixer_stop();
-	for (wait = 0; wait < STREAM_STOP_POLLS &&
-		__atomic_load_n(&callback_active, __ATOMIC_ACQUIRE) != 0; ++wait)
-		ksceKernelDelayThread(STREAM_STOP_POLL_US);
-	/* The caller closes the pipe next, so a callback still running here
-	 * would be touching a pipe that is about to go away. */
-	if (__atomic_load_n(&callback_active, __ATOMIC_ACQUIRE) != 0)
-		uac_log(LOG_PREFIX "stream stop: callback still active after %d ms\n",
-			(STREAM_STOP_POLLS * STREAM_STOP_POLL_US) / 1000);
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	error = __atomic_exchange_n(&stream_error, 0, __ATOMIC_ACQ_REL);
-	if (error < 0)
-		uac_log(LOG_PREFIX "stream stopped after error: 0x%08x\n", error);
-#endif
+	for (;;) {
+		state = __atomic_load_n(&stream_state, __ATOMIC_ACQUIRE);
+		if (state == STREAM_IDLE)
+			return;
+		if (state == STREAM_STOPPING)
+			break;
+		expected = state;
+		if (__atomic_compare_exchange_n(&stream_state, &expected,
+			STREAM_STOPPING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			if (state == STREAM_RUNNING)
+				uac_mixer_stop();
+			break;
+		}
+	}
+
+	/* The owner closes the pipe after the request or callback retires. */
+	for (wait = 0; wait < STOP_POLLS; ++wait) {
+		if (__atomic_load_n(&stream_state, __ATOMIC_ACQUIRE) == STREAM_IDLE)
+			return;
+		ksceKernelDelayThread(STOP_POLL_US);
+	}
+	uac_log(LOG_PREFIX "stream stop timed out after %u ms\n",
+		(STOP_POLLS * STOP_POLL_US) / 1000u);
 }
