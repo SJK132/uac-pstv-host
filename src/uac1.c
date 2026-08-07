@@ -531,18 +531,23 @@ static void try_finalize_cleanup(void)
 		UAC1_STATE_FINALIZING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 		return;
 
+	was_detached = __atomic_load_n(&active.cancelled, __ATOMIC_ACQUIRE);
 	uac_stream_stop();
 	stream_pipe = __atomic_exchange_n(
 		&active.stream_pipe, -1, __ATOMIC_ACQ_REL);
 	control_pipe = __atomic_exchange_n(
 		&active.control_pipe, -1, __ATOMIC_ACQ_REL);
-	if (stream_pipe >= 0)
-		ksceUsbdClosePipe(stream_pipe);
+	if (stream_pipe >= 0) {
+		int close_result = ksceUsbdClosePipe(stream_pipe);
+
+		uac_log(LOG_PREFIX "stream pipe close: 0x%08x\n", close_result);
+		if (close_result >= 0 || was_detached)
+			uac_stream_pipe_closed(stream_pipe);
+	}
 	if (control_pipe >= 0)
 		ksceUsbdClosePipe(control_pipe);
 
 	device_id = __atomic_load_n(&active.device_id, __ATOMIC_ACQUIRE);
-	was_detached = __atomic_load_n(&active.cancelled, __ATOMIC_ACQUIRE);
 	clear_active_fields();
 
 	/* Async failure may be followed later by the real detach callback. */
