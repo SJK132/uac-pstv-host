@@ -1,0 +1,10 @@
+# Build output
+build/
+.build-*/
+*.velf
+*.o
+*.obj
+
+# Local reference material and firmware dumps, not part of the plugin
+probes/
+elf/
