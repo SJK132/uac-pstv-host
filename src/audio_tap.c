@@ -5,7 +5,7 @@
  * duration of one USB session this file takes that route over: it hooks the two
  * AVConfig entry points that start and stop the hardware DataSend worker, flips
  * the route word to RAM output, and runs a stand-in worker that passes each
- * 480-frame page to stream.c instead.
+ * captured page to stream.c instead.
  *
  * The whole file lives between audio_tap_begin() and audio_tap_end(), both
  * called from the feeder thread in stream.c.  Nothing here runs on a USBD
@@ -37,9 +37,11 @@
 #define CAPTURE_BYTES UAC_STREAM_CAPTURE_BYTES
 /*
  * Priority and affinity are copied from Sony's own DataSend worker, which this
- * thread stands in for -- it feeds the same 480-frame RAM-output pages on the
- * same cadence, so it needs the same scheduling treatment.  0x12 is high, and
- * deliberately so; do not lower it without measuring for dropouts first.
+ * thread stands in for -- it feeds the same RAM-output pages, so it needs the
+ * same scheduling treatment.  0x12 is high, and deliberately so; do not lower it
+ * without measuring for dropouts first.  Note that shrinking CAPTURE_FRAMES
+ * raises this thread's wakeup rate proportionally, which is the cost side of
+ * buying lower latency that way.
  */
 #define CAPTURE_PRIORITY 0x12
 #define CAPTURE_STACK 0x2000u
@@ -408,7 +410,8 @@ int audio_tap_begin(void)
 
 	result = acquire_route();
 	if (result >= 0) {
-		uac_log(LOG_PREFIX "native 480-frame A/B capture active\n");
+		uac_log(LOG_PREFIX "native %u-frame A/B capture active\n",
+			(unsigned int)CAPTURE_FRAMES);
 		return 0;
 	}
 

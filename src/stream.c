@@ -4,17 +4,20 @@
  * Two halves that meet in the middle:
  *
  *   - the source side, driven by audio_tap's capture worker, publishes whole
- *     480-frame blocks into a two-slot seqlock (uac_stream_publish);
+ *     captured blocks into a small seqlock (uac_stream_publish);
  *   - the transport side runs one feeder thread that cuts those blocks into
  *     48-frame (1 ms) packets and keeps exactly one isochronous request in
- *     flight, with a second context staged behind it.
+ *     flight, with the remaining contexts staged behind it.
  *
- * The seqlock is latest-wins, and deliberately not a FIFO.  The capture worker
- * is clocked by Sony's audio hardware rather than by us, so producer and
- * consumer are never rate-matched; a queue between them grows without bound and
- * turns straight into latency, while dropping a stale block costs 10 ms once
- * and self-corrects.  Anyone reaching for a ring buffer here should measure the
- * producer's lead first -- it has been observed a thousand packets ahead.
+ * The seqlock is latest-wins, and deliberately not a FIFO.  Producer and
+ * consumer run off unrelated clocks -- Sony's audio hardware and the USB host's
+ * frame timer -- so they are never rate-matched, and USB completions have been
+ * measured stalling for 250 ms at a stretch.  The producer runs straight through
+ * such a stall, ending up ~50 blocks ahead.  Latest-wins throws the backlog away
+ * and resumes at current audio for the price of one discontinuity; a FIFO would
+ * queue every stalled block faithfully and add that 250 ms to output latency
+ * permanently, again on each stall.  Anyone reaching for a ring buffer here
+ * should read that sentence twice.
  */
 
 #include "stream.h"
@@ -31,16 +34,29 @@
 
 #define LOG_PREFIX "[uac-pstv-usb] "
 
-/*
- * Sony-shaped shallow transport for the tested HS bInterval=4 adapter.
- * Two fixed request contexts: one submitted, one READY/preparing.
- */
+/* Sony-shaped shallow transport for the tested HS bInterval=4 adapter. */
 #define PACKET_FRAMES 48u
 #define PACKET_BYTES (PACKET_FRAMES * 4u)
-#define PCM_SLOT_COUNT 2u
+/*
+ * Staging depth, in whole captured blocks.  This is history, not queue: the
+ * producer never waits for a free slot, it overwrites the oldest unconditionally
+ * every block.  So depth buys stall tolerance -- how far the feeder can fall
+ * behind before the block it is reading gets pulled out from under it and
+ * pcm_resync() has to jump forward, which is audible -- and costs no latency,
+ * since latency is fixed by where resync places the cursor.  Power of two;
+ * PCM_SLOT_MASK indexes with it.
+ */
+#define PCM_SLOT_COUNT 4u
+#define PCM_SLOT_MASK (PCM_SLOT_COUNT - 1u)
 #define SONY_ISO_PACKET_SLOTS 8u
 #define TRANSFER_BYTES PACKET_BYTES
-#define CONTEXT_COUNT 2u
+/*
+ * Transport depth: one request in flight, the rest staged behind it.  Each
+ * context is one 1 ms packet, so this is both the feeder's slack -- how long it
+ * may be held off before the transport runs out of prepared packets -- and a
+ * direct addend to output latency.  Three buys 2 ms of slack for 1 ms of delay.
+ */
+#define CONTEXT_COUNT 3u
 
 #define FREE_EVENT_BIT 0x00000001u
 #define PCM_EVENT_BIT 0x00000002u
@@ -55,6 +71,37 @@
  * in the common case, which converges in tens of milliseconds.
  */
 #define FEEDER_STOP_TIMEOUT_US 4000000u
+
+/*
+ * Feeder scheduling.
+ *
+ * 0x40 is SCE_KERNEL_HIGHEST_PRIORITY_USER, the bottom of the kernel band, and a
+ * poor place for a thread with a 1 ms deadline.  0x20 lifts it clear while
+ * staying below the capture worker's 0x12 -- that ordering is deliberate, since
+ * the capture worker is the producer and starving it stops everything
+ * downstream.  Raising this is safe: the feeder does one CAS and one 192-byte
+ * copy per wakeup and then blocks, so it cannot monopolise a core, it only needs
+ * waking promptly.
+ *
+ * The affinity is the more defensible half, and for a cache reason rather than a
+ * scheduling one.  Pinned to the capture worker's core (CAPTURE_CPU_MASK in
+ * audio_tap.c -- both are SCE_KERNEL_CPU_MASK_USER_3), a freshly published block
+ * is still in L1 when the feeder reads it back out; on separate cores that is
+ * fifteen line invalidations per block, a few thousand a second.
+ *
+ * Stated honestly, because the measurements were noisier than they first looked:
+ * the priority change moved the starve rate only slightly and within run-to-run
+ * variance, and an A/B against 0x40-unpinned produced identical resync counts,
+ * so neither setting is implicated in the USB stalls described at the top of
+ * this file.  Compare the session line before and after touching either.
+ */
+#ifndef FEEDER_PRIORITY
+#define FEEDER_PRIORITY 0x20
+#endif
+#ifndef FEEDER_CPU_MASK
+#define FEEDER_CPU_MASK 0x80000u
+#endif
+#define FEEDER_STACK 0x3000u
 #define CALLBACK_CLOSING 0x80000000u
 #define CALLBACK_REFS 0x7fffffffu
 
@@ -69,6 +116,10 @@
 
 #if TRANSFER_BYTES != 192u
 #error Tested transport must remain one 192-byte packet per request
+#endif
+
+#if CONTEXT_COUNT < 2u
+#error Need at least one request in flight and one staged behind it
 #endif
 
 #if UAC_STREAM_CAPTURE_FRAMES % PACKET_FRAMES != 0u
@@ -119,12 +170,31 @@ typedef struct {
 	int state;
 } StreamContext;
 
+/*
+ * One captured block, plus the seqlock words that publish it.  The PCM starts
+ * on a cache line so both the producer's memcpy in and the consumer's copy out
+ * begin aligned, and guard sits next to the data it guards rather than in a
+ * separate array, so validating a read touches the same lines as the read.
+ *
+ * At the current block size a slot is exactly 1 KiB and the array exactly 4 KiB.
+ * Tidy, but incidental -- the array is only 64-aligned, so it is page-sized, not
+ * page-aligned, and aligning it to a page was measured to change no instructions
+ * for 3.4 KiB of padding.  What the asserts below enforce is the part that would
+ * silently cost performance: every slot landing on a line boundary, not just the
+ * first, which holds for any block size that is a multiple of PACKET_FRAMES.
+ */
 typedef struct {
 	uint32_t guard;
 	uint32_t sequence;
 	int16_t pcm[UAC_STREAM_CAPTURE_FRAMES * 2u]
 		__attribute__((aligned(64)));
 } PcmSlot;
+
+typedef char pcm_slot_must_tile_cache_lines[
+	(sizeof(PcmSlot) % 64u == 0u) ? 1 : -1];
+typedef char pcm_slot_count_must_be_power_of_two[
+	(PCM_SLOT_COUNT != 0u &&
+	 (PCM_SLOT_COUNT & PCM_SLOT_MASK) == 0u) ? 1 : -1];
 
 static StreamContext contexts[CONTEXT_COUNT] __attribute__((aligned(64)));
 static PcmSlot pcm_slots[PCM_SLOT_COUNT] __attribute__((aligned(64)));
@@ -151,12 +221,80 @@ static SceUID free_event = -1;
 static SceUID pcm_event = -1;
 static SceUID feeder_thread = -1;
 
-static int pcm_enabled;
+/*
+ * Session instrumentation, logging builds only.  What each number means, since
+ * only two of the four are audible:
+ *
+ *   starve   the transport won the right to submit and found the next context
+ *            unfilled, so the isochronous stream gets a hole.  Audible.
+ *   pcm wait the feeder had a context but no PCM to put in it.  Absorbed by the
+ *            staged contexts; not audible by itself.
+ *   resync   the producer lapped the block being read and the cursor jumped to
+ *            current audio.  Audible, and the one that matters most.
+ *   margin   blocks the producer is ahead by when the consumer reads.  One is
+ *            the design point; zero means it caught up and is about to wait.
+ *
+ * These swing by orders of magnitude between runs of the same binary -- pcm
+ * waits have gone 3695 and 2 on consecutive sessions -- so read patterns across
+ * several sessions and never conclude anything from one number.
+ */
+#ifdef UAC_PSTV_ENABLE_LOGGING
+static uint32_t starve_count;
+static uint32_t submit_count;
+static uint32_t pcm_wait_count;
+static uint32_t resync_count;
+static uint32_t margin_min = 0xffffffffu;
+#define COUNT_STARVE() __atomic_add_fetch(&starve_count, 1u, __ATOMIC_RELAXED)
+#define COUNT_SUBMIT() __atomic_add_fetch(&submit_count, 1u, __ATOMIC_RELAXED)
+#define COUNT_PCM_WAIT() __atomic_add_fetch(&pcm_wait_count, 1u, __ATOMIC_RELAXED)
+/*
+ * Where each resync happened, not just how many.  They come in single digits per
+ * session, so each one is worth looking at: the gap tells you what caused it --
+ * four or five blocks is ordinary jitter, fifty is a USB stall.  Stored rather
+ * than logged inline, because uac_log() writes to the filesystem and doing that
+ * from pcm_next() would stall the feeder and manufacture the very problem being
+ * measured.
+ */
+#define RESYNC_LOG_MAX 8u
+static uint32_t resync_at[RESYNC_LOG_MAX];
+static uint32_t resync_gap[RESYNC_LOG_MAX];
+#define COUNT_RESYNC(gap) do { \
+	uint32_t n = __atomic_fetch_add(&resync_count, 1u, __ATOMIC_RELAXED); \
+	if (n < RESYNC_LOG_MAX) { \
+		resync_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED); \
+		resync_gap[n] = (gap); \
+	} \
+} while (0)
+#define TRACK_MARGIN(m) do { \
+	uint32_t seen = (m); \
+	uint32_t old = __atomic_load_n(&margin_min, __ATOMIC_RELAXED); \
+	while (seen < old && \
+	       !__atomic_compare_exchange_n(&margin_min, &old, seen, 1, \
+			__ATOMIC_RELAXED, __ATOMIC_RELAXED)) \
+		; \
+} while (0)
+#else
+#define COUNT_STARVE() ((void)0)
+#define COUNT_SUBMIT() ((void)0)
+#define COUNT_PCM_WAIT() ((void)0)
+#define COUNT_RESYNC(gap) ((void)0)
+#define TRACK_MARGIN(m) ((void)0)
+#endif
+
+/*
+ * Producer state, written by audio_tap's capture worker; the consumer cursor
+ * below is the feeder's alone.  Each starts a cache line so neither can
+ * invalidate the other.  Note that with FEEDER_CPU_MASK pinning both threads to
+ * one core this currently buys nothing -- keep it as insurance against that
+ * pinning changing, not as an active optimisation.  Costs padding, not
+ * instructions.
+ */
+static int pcm_enabled __attribute__((aligned(64)));
 static int pcm_producer_busy;
 static uint32_t pcm_latest;
 
 /* Consumer state belongs exclusively to the feeder thread. */
-static uint32_t pcm_sequence;
+static uint32_t pcm_sequence __attribute__((aligned(64)));
 static uint32_t pcm_offset;
 static int pcm_valid;
 
@@ -200,9 +338,17 @@ static void pcm_write(const void *pcm)
 	uint32_t sequence = next_pcm_sequence(
 		__atomic_load_n(&pcm_latest, __ATOMIC_RELAXED));
 
-	slot = &pcm_slots[sequence & 1u];
-	__atomic_store_n(&slot->guard, (sequence << 1) | 1u,
-		__ATOMIC_SEQ_CST);
+	slot = &pcm_slots[sequence & PCM_SLOT_MASK];
+	/*
+	 * Mark the slot odd, then fence.  All this needs is for the marker to be
+	 * visible before the data writes that follow, which is a release fence
+	 * after a relaxed store: one dmb.  A seq_cst store would compile to
+	 * dmb-str-dmb and buy nothing -- there is a single producer, so there is
+	 * no second writer for total order to arbitrate between.  This is the
+	 * write_seqlock() half.
+	 */
+	__atomic_store_n(&slot->guard, (sequence << 1) | 1u, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 	memcpy(slot->pcm, pcm, UAC_STREAM_CAPTURE_BYTES);
 	__atomic_store_n(&slot->sequence, sequence, __ATOMIC_RELAXED);
 	__atomic_store_n(&slot->guard, sequence << 1, __ATOMIC_RELEASE);
@@ -224,8 +370,14 @@ int uac_stream_publish(const void *pcm)
 
 static int has_free_context(void)
 {
-	return __atomic_load_n(&contexts[0].state, __ATOMIC_ACQUIRE) == CONTEXT_FREE ||
-	       __atomic_load_n(&contexts[1].state, __ATOMIC_ACQUIRE) == CONTEXT_FREE;
+	uint32_t index;
+
+	for (index = 0; index < CONTEXT_COUNT; ++index) {
+		if (__atomic_load_n(&contexts[index].state, __ATOMIC_ACQUIRE) ==
+		    CONTEXT_FREE)
+			return 1;
+	}
+	return 0;
 }
 
 static void finish_retire(void)
@@ -324,10 +476,16 @@ static int pump_ready(void)
 
 	context = &contexts[submit_index];
 	if (__atomic_load_n(&context->state, __ATOMIC_ACQUIRE) != CONTEXT_READY) {
+		/* Nothing staged: the feeder fell behind and the stream gaps. */
+		COUNT_STARVE();
 		__atomic_store_n(&transfer_active, 0, __ATOMIC_RELEASE);
 		return FEED_QUEUED;
 	}
-	submit_index ^= 1u;
+	COUNT_SUBMIT();
+	/* Rotate by compare rather than modulo: CONTEXT_COUNT need not be a
+	 * power of two, and a divide has no business on the 1 ms path. */
+	if (++submit_index == CONTEXT_COUNT)
+		submit_index = 0u;
 
 	/* Zero means the request is now owned by USBD and will call back. */
 	result = submit_context(context);
@@ -375,6 +533,7 @@ static int wait_for_free_context(uint32_t generation, StreamContext **out)
 
 	for (;;) {
 		uint32_t matched_bits;
+		uint32_t index;
 		int result;
 		int expected;
 
@@ -391,15 +550,23 @@ static int wait_for_free_context(uint32_t generation, StreamContext **out)
 		    __atomic_load_n(&stream_generation, __ATOMIC_ACQUIRE) != generation)
 			return FEED_STREAM_ENDED;
 
-		expected = CONTEXT_FREE;
-		if (__atomic_compare_exchange_n(&contexts[0].state, &expected,
-			CONTEXT_WRITING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-			*out = &contexts[0];
-		else {
+		/*
+		 * First fit, which is also submit order -- and it has to be,
+		 * because filling out of order would transmit packets out of
+		 * order.  Only one request is ever in flight, so in steady
+		 * state exactly one context is FREE: the one that just
+		 * completed, which is precisely the one pump_ready() reaches
+		 * next.  During priming every context is FREE and this fills
+		 * 0..N-1, matching submit_index starting at zero.
+		 */
+		for (index = 0; index < CONTEXT_COUNT; ++index) {
 			expected = CONTEXT_FREE;
-			if (__atomic_compare_exchange_n(&contexts[1].state, &expected,
-				CONTEXT_WRITING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-				*out = &contexts[1];
+			if (__atomic_compare_exchange_n(&contexts[index].state,
+				&expected, CONTEXT_WRITING, 0, __ATOMIC_ACQ_REL,
+				__ATOMIC_ACQUIRE)) {
+				*out = &contexts[index];
+				break;
+			}
 		}
 		if (*out != NULL) {
 			if (has_free_context())
@@ -422,8 +589,9 @@ static void pcm_begin(void)
 	pcm_valid = 0;
 	reset_event(pcm_event);
 	__atomic_store_n(&pcm_enabled, 1, __ATOMIC_RELEASE);
-	uac_log("[uac-pstv-source] armed: 2x480 PCM staging; "
-		"48-frame packetizer\n");
+	uac_log("[uac-pstv-source] armed: %ux%u PCM staging; "
+		"%u-frame packetizer\n", PCM_SLOT_COUNT,
+		UAC_STREAM_CAPTURE_FRAMES, PACKET_FRAMES);
 }
 
 static void pcm_end(void)
@@ -436,7 +604,7 @@ static void pcm_end(void)
 
 static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
 {
-	PcmSlot *slot = &pcm_slots[sequence & 1u];
+	PcmSlot *slot = &pcm_slots[sequence & PCM_SLOT_MASK];
 	uint32_t expected = sequence << 1;
 	uint32_t before;
 	uint32_t attempt;
@@ -448,7 +616,18 @@ static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
 			continue;
 		memcpy(packet, (const uint8_t *)slot->pcm + offset * 4u,
 			PACKET_BYTES);
-		if (__atomic_load_n(&slot->guard, __ATOMIC_ACQUIRE) == before)
+		/*
+		 * Fence first, then a relaxed read -- not an acquire load.
+		 * Acquire orders what comes after it; what has to be ordered
+		 * here is the memcpy above, which must be complete before the
+		 * guard is sampled again.  An acquire load puts its barrier on
+		 * the far side and leaves the copy free to be reordered past
+		 * the check, which is how a torn read passes validation.  Same
+		 * two instructions either way; only the order differs.  This is
+		 * the read_seqretry() half of the pattern.
+		 */
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		if (__atomic_load_n(&slot->guard, __ATOMIC_RELAXED) == before)
 			return 1;
 	}
 	return 0;
@@ -484,13 +663,21 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 		}
 		pcm_resync(latest);
 	}
-	if (latest >= pcm_sequence + PCM_SLOT_COUNT)
+	/* How far ahead the producer is right now; zero means we caught up. */
+	TRACK_MARGIN(latest - pcm_sequence);
+
+	if (latest >= pcm_sequence + PCM_SLOT_COUNT) {
+		/* Lapped: the block being read got overwritten. Audible jump. */
+		COUNT_RESYNC(latest - pcm_sequence);
 		pcm_resync(latest);
+	}
 
 	if (!pcm_copy(pcm_sequence, pcm_offset, packet)) {
 		latest = __atomic_load_n(&pcm_latest, __ATOMIC_ACQUIRE);
-		if (latest >= pcm_sequence + PCM_SLOT_COUNT)
+		if (latest >= pcm_sequence + PCM_SLOT_COUNT) {
+			COUNT_RESYNC(latest - pcm_sequence);
 			pcm_resync(latest);
+		}
 		if (!pcm_copy(pcm_sequence, pcm_offset, packet))
 			return 1;
 	}
@@ -550,7 +737,7 @@ static int queue_next_source_packet(void)
 
 	__atomic_store_n(&context->state, CONTEXT_READY, __ATOMIC_RELEASE);
 
-	/* The transport stays idle until both contexts hold a packet. */
+	/* The transport stays idle until every context holds a packet. */
 	if (prime_count < CONTEXT_COUNT && ++prime_count == CONTEXT_COUNT)
 		__atomic_store_n(&primed, 1, __ATOMIC_RELEASE);
 
@@ -580,6 +767,12 @@ static int usb_feeder_thread(SceSize args, void *argp)
 	while (uac_stream_is_active()) {
 		result = queue_next_source_packet();
 		if (result == FEED_NEED_PCM) {
+			/*
+			 * The feeder had a context but no PCM to put in it.  If
+			 * this tracks the starve count, the shortfall is on the
+			 * producer side and feeder priority is irrelevant.
+			 */
+			COUNT_PCM_WAIT();
 			result = pcm_wait();
 			if (result < 0) {
 				stop_stream(result, USBD_CC_NOERR);
@@ -604,6 +797,31 @@ static int usb_feeder_thread(SceSize args, void *argp)
 				"virtual Sony DataSend stop failed: 0x%08x\n", result);
 	}
 	pcm_end();
+#ifdef UAC_PSTV_ENABLE_LOGGING
+	uac_log(LOG_PREFIX
+		"session: %u packets, %u starved, %u pcm waits, "
+		"%u resyncs, min margin %u blocks\n",
+		__atomic_load_n(&submit_count, __ATOMIC_RELAXED),
+		__atomic_load_n(&starve_count, __ATOMIC_RELAXED),
+		__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED),
+		__atomic_load_n(&resync_count, __ATOMIC_RELAXED),
+		__atomic_load_n(&margin_min, __ATOMIC_RELAXED));
+	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
+	__atomic_store_n(&starve_count, 0u, __ATOMIC_RELAXED);
+	__atomic_store_n(&pcm_wait_count, 0u, __ATOMIC_RELAXED);
+	{
+		uint32_t total = __atomic_load_n(&resync_count, __ATOMIC_RELAXED);
+		uint32_t shown = total < RESYNC_LOG_MAX ? total : RESYNC_LOG_MAX;
+		uint32_t i;
+
+		for (i = 0; i < shown; ++i)
+			uac_log(LOG_PREFIX
+				"  resync %u at packet %u, producer was %u blocks ahead\n",
+				i + 1u, resync_at[i], resync_gap[i]);
+	}
+	__atomic_store_n(&resync_count, 0u, __ATOMIC_RELAXED);
+	__atomic_store_n(&margin_min, 0xffffffffu, __ATOMIC_RELAXED);
+#endif
 	return 0;
 }
 
@@ -678,7 +896,7 @@ int uac_stream_start(int pipe_id)
 		return -1;
 
 	result = ksceKernelCreateThread("uac_usb_feeder", usb_feeder_thread,
-		0x40, 0x3000, 0, 0, NULL);
+		FEEDER_PRIORITY, FEEDER_STACK, 0, FEEDER_CPU_MASK, NULL);
 	if (result < 0) {
 		__atomic_store_n(&stream_state, STREAM_IDLE, __ATOMIC_RELEASE);
 		__atomic_store_n(&stream_pipe, -1, __ATOMIC_RELEASE);
@@ -699,9 +917,10 @@ int uac_stream_start(int pipe_id)
 	}
 
 	uac_log(LOG_PREFIX
-		"ready: 2 fixed 1-ms contexts; 1 in flight + 1 READY/preparing; "
-		"completion-driven A/B rotation; "
-		"1x192 bytes/request; no deep runway; virtual native DataSend\n");
+		"ready: %u fixed 1-ms contexts; 1 in flight + %u staged; "
+		"completion-driven rotation; 1x%u bytes/request; "
+		"virtual native DataSend\n",
+		CONTEXT_COUNT, CONTEXT_COUNT - 1u, TRANSFER_BYTES);
 	return 0;
 }
 

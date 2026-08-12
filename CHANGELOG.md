@@ -2,26 +2,66 @@
 
 ## v1.0.1 - 2026-08-12
 
-Recovery fixes for the sleep/wake path, found by a report of no audio after a
-PSX game plus standby until the device was physically replugged.
+Output latency cut from roughly 22 ms to 13 ms, a memory-ordering fix in the PCM
+handoff, and recovery fixes for the sleep/wake path -- the last of these from a
+report of no audio after a PSX game plus standby until the device was replugged.
+
+### Latency
+
+- Capture blocks halved to 240 frames (5 ms). Latency is about two block
+  periods: one to fill a block, and one more because the consumer has to start a
+  whole block behind to survive the discrete arrival cadence. Block size is
+  therefore the only lever that moves it. Confirmed on hardware that Sony's
+  RAM-output submit accepts the smaller page.
+- PCM staging widened from two slots to four, restoring the stall tolerance that
+  smaller blocks would otherwise have halved. Slot count costs no latency -- it
+  sets how far the feeder may fall behind, not where it starts reading.
+- A third transport context, taking the feeder's slack from one packet period to
+  two in exchange for 1 ms of delay.
+- The feeder thread runs at priority 0x20 instead of 0x40 and is pinned to the
+  capture worker's core, so a freshly published block is still in L1 when it is
+  read back out rather than costing fifteen cache-line transfers per block.
+
+### Correctness
+
+- Fixed memory ordering on the seqlock read side. The second guard read used an
+  acquire load, which places its barrier *after* the read and leaves the data
+  copy free to be reordered past the validation -- the classic way a torn read
+  passes as valid. It now fences before a relaxed read, matching Linux's
+  `read_seqretry()`. Same two instructions, correct order. The symptom would have
+  been a rare, unreproducible click.
+- The write side no longer uses a seq_cst store where a relaxed store plus a
+  release fence suffice, removing one barrier per published block.
+
+### Recovery
 
 - An attach that arrives while a teardown is still running is now remembered and
-  retried once teardown completes. USBD offers a device exactly once, so
-  refusing that attach previously lost it for good: the device stayed enumerated
-  with no session behind it and only a replug recovered it. The window is widest
-  coming out of sleep with audio streaming, which is when teardown is slowest.
+  retried once teardown completes. USBD offers a device exactly once, so refusing
+  that attach previously lost it for good: the device stayed enumerated with no
+  session behind it and only a replug recovered it. The window is widest coming
+  out of sleep with audio streaming, which is when teardown is slowest.
 - Releasing the AVConfig route no longer waits for Sony to acknowledge through
   the hooked device-stop wrapper. Capture is already stopped by that point, so
-  Sony may reasonably decide there is nothing to stop and never call it, leaving
-  the wait to burn its full one-second timeout on every teardown. The release now
-  turns on AVConfig's own state fields alone; the acknowledgement is still
-  counted and logged.
-- Logging builds now print the version and git revision as the first line of
-  each session, so a log identifies the exact binary that produced it.
+  Sony may reasonably decide there is nothing to stop and never call it. Observed
+  both ways across sessions, which is exactly why the release must not depend on
+  it; when it did not come, the wait burned its full one-second timeout.
 
-Measured on 3.65: route release settles in a repeatable ~401 ms, and suspend
-retires the session ahead of the detach that follows, so `SET_INTERFACE(alt 0)`
-is still delivered and an external DAC returns to its internal clock.
+### Instrumentation
+
+- Logging builds print the version and git revision as the first line of each
+  session, and report per-session packet, starve, PCM-wait and resync counts plus
+  the minimum producer lead, recording where each resync occurred. Release builds
+  are byte-identical with or without these.
+
+Measured on 3.65. Route release settles in a repeatable ~401 ms. Suspend retires
+the session ahead of the detach that follows, so `SET_INTERFACE(alt 0)` is still
+delivered and an external DAC returns to its internal clock.
+
+USB completions were found to stall for ~250 ms at a time, several times per
+session, independent of our thread priorities (verified by A/B). The producer
+runs on through such a stall and ends up ~50 blocks ahead; the latest-wins
+staging discards the backlog and resumes at current audio. A FIFO would instead
+queue it and add that 250 ms to output latency permanently, on every stall.
 
 ## v1.0 - 2026-08-12
 
