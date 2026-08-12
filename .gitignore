@@ -4,6 +4,7 @@ build/
 *.velf
 *.o
 *.obj
+*.skprx
 
 # Local reference material and firmware dumps, not part of the plugin
 probes/
