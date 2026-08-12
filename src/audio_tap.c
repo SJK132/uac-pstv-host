@@ -1,3 +1,17 @@
+/*
+ * AVConfig route ownership.
+ *
+ * Sony's audio path normally hands decoded PCM to the HDMI transport.  For the
+ * duration of one USB session this file takes that route over: it hooks the two
+ * AVConfig entry points that start and stop the hardware DataSend worker, flips
+ * the route word to RAM output, and runs a stand-in worker that passes each
+ * 480-frame page to stream.c instead.
+ *
+ * The whole file lives between audio_tap_begin() and audio_tap_end(), both
+ * called from the feeder thread in stream.c.  Nothing here runs on a USBD
+ * callback, which is why it is allowed to block on the route settling.
+ */
+
 #include "audio_tap.h"
 
 #include "log.h"
@@ -260,16 +274,29 @@ static int release_route(void)
 		result = UAC_TAP_ROUTE_WAKE_FAILED;
 
 	/*
-	 * The route word is already cleared, so ownership must be dropped even if
-	 * AVConfig never converges.  Holding it would keep physical_stop()
-	 * swallowing Sony's device stop forever and keep cleanup() from removing
-	 * the hooks, turning a transient timeout into dead audio until reboot.
+	 * The release is complete when AVConfig's own four state fields say so,
+	 * and on nothing else.
+	 *
+	 * Waiting on physical_stop_count as a fifth condition is tempting -- it
+	 * would mean Sony had acknowledged the teardown through the device-stop
+	 * wrapper we hook.  Do not add it.  stop_capture() above has already
+	 * cleared send_worker_active, so Sony is entitled to conclude there is
+	 * nothing running to stop and never call that wrapper at all.  When it
+	 * makes that choice the condition can never be satisfied and the loop
+	 * spends the entire ROUTE_TIMEOUT_US before giving up -- a second during
+	 * which any incoming attach has to be deferred.  The count is maintained
+	 * and logged because a zero is worth knowing about, not because the
+	 * release depends on it.
+	 *
+	 * Ownership is dropped whether or not the wait succeeded.  The route word
+	 * is already cleared by this point, so keeping ownership would only leave
+	 * physical_stop() swallowing Sony's device stop and stop cleanup() from
+	 * removing the hooks.
 	 */
 	start = ksceKernelGetSystemTimeLow();
 	while (*audio.selected_target == ROUTE_RAM ||
 	       *audio.transport_ready != 0u || *audio.route_dirty != 0u ||
-	       *audio.send_worker_active != 0u ||
-	       __atomic_load_n(&physical_stop_count, __ATOMIC_ACQUIRE) == 0u) {
+	       *audio.send_worker_active != 0u) {
 		if ((uint32_t)(ksceKernelGetSystemTimeLow() - start) >
 		    ROUTE_TIMEOUT_US) {
 			result = UAC_TAP_RELEASE_TIMEOUT;
@@ -277,6 +304,9 @@ static int release_route(void)
 		}
 		ksceKernelDelayThread(ROUTE_POLL_US);
 	}
+	uac_log(LOG_PREFIX "route released in %u us, %u physical stops\n",
+		(unsigned int)(ksceKernelGetSystemTimeLow() - start),
+		__atomic_load_n(&physical_stop_count, __ATOMIC_ACQUIRE));
 	__atomic_store_n(&virtual_owner, 0, __ATOMIC_RELEASE);
 	return result;
 }

@@ -1,3 +1,13 @@
+/*
+ * Module entry points and system-wide lifecycle.
+ *
+ * Start order is dependency order -- stream, then the uac1 teardown worker,
+ * then the USB driver -- and stop reverses it, so nothing can ever be called
+ * back into after it has been torn down.  audio_tap deliberately does not
+ * appear in that sequence: it is owned by the feeder thread and lives exactly
+ * as long as one USB session.
+ */
+
 #include "audio_tap.h"
 #include "log.h"
 #include "stream.h"
@@ -88,6 +98,10 @@ int module_start(SceSize args, const void *argp)
 	(void)args;
 	(void)argp;
 	uac_log_open();
+	/* First line of every session: the log appends across boots, so this both
+	 * identifies the build and marks where one run ends and the next begins. */
+	uac_log(LOG_PREFIX "uac-pstv %s (%s)\n", UAC_PSTV_VERSION,
+		UAC_PSTV_BUILD_REV);
 
 	/*
 	 * PSTV only.  "Dolce" is Sony's name for it.  A handheld Vita has no USB

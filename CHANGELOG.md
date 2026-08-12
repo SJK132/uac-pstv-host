@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.0.1 - 2026-08-12
+
+Recovery fixes for the sleep/wake path, found by a report of no audio after a
+PSX game plus standby until the device was physically replugged.
+
+- An attach that arrives while a teardown is still running is now remembered and
+  retried once teardown completes. USBD offers a device exactly once, so
+  refusing that attach previously lost it for good: the device stayed enumerated
+  with no session behind it and only a replug recovered it. The window is widest
+  coming out of sleep with audio streaming, which is when teardown is slowest.
+- Releasing the AVConfig route no longer waits for Sony to acknowledge through
+  the hooked device-stop wrapper. Capture is already stopped by that point, so
+  Sony may reasonably decide there is nothing to stop and never call it, leaving
+  the wait to burn its full one-second timeout on every teardown. The release now
+  turns on AVConfig's own state fields alone; the acknowledgement is still
+  counted and logged.
+- Logging builds now print the version and git revision as the first line of
+  each session, so a log identifies the exact binary that produced it.
+
+Measured on 3.65: route release settles in a repeatable ~401 ms, and suspend
+retires the session ahead of the detach that follows, so `SET_INTERFACE(alt 0)`
+is still delivered and an external DAC returns to its internal clock.
+
 ## v1.0 - 2026-08-12
 
 Complete rework of how audio is captured. v0.1-v0.3 hooked individual SceAudio

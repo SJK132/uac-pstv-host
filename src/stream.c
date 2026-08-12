@@ -1,3 +1,22 @@
+/*
+ * PCM handoff and USB transport.
+ *
+ * Two halves that meet in the middle:
+ *
+ *   - the source side, driven by audio_tap's capture worker, publishes whole
+ *     480-frame blocks into a two-slot seqlock (uac_stream_publish);
+ *   - the transport side runs one feeder thread that cuts those blocks into
+ *     48-frame (1 ms) packets and keeps exactly one isochronous request in
+ *     flight, with a second context staged behind it.
+ *
+ * The seqlock is latest-wins, and deliberately not a FIFO.  The capture worker
+ * is clocked by Sony's audio hardware rather than by us, so producer and
+ * consumer are never rate-matched; a queue between them grows without bound and
+ * turns straight into latency, while dropping a stale block costs 10 ms once
+ * and self-corrects.  Anyone reaching for a ring buffer here should measure the
+ * producer's lead first -- it has been observed a thousand packets ahead.
+ */
+
 #include "stream.h"
 #include "audio_tap.h"
 #include "log.h"
@@ -119,11 +138,14 @@ static uint32_t submit_index;
 static uint32_t prime_count;
 static int primed;
 /*
- * One bit per flag, never two bits in one flag.  Both waiters use
- * SCE_EVENT_WAITCLEAR, which clears the whole flag rather than just the matched
- * pattern, so a shared flag lets each wake destroy the other subsystem's
- * pending wakeup.  Before priming there is no transfer in flight to re-post
- * FREE_EVENT_BIT, so that loss deadlocks the feeder permanently.
+ * Two event flags, one bit each.  Never merge them into one flag.
+ *
+ * Both waiters use SCE_EVENT_WAITCLEAR, which clears the entire flag rather
+ * than only the matched pattern, so a shared flag lets either wake destroy the
+ * other subsystem's pending wakeup.  That is unrecoverable during priming:
+ * there is no transfer in flight yet to re-post FREE_EVENT_BIT, so the feeder
+ * waits forever and the stream comes up silent with every setup step in the log
+ * reporting success.  Use SCE_EVENT_WAITCLEAR_PAT if you ever do need to share.
  */
 static SceUID free_event = -1;
 static SceUID pcm_event = -1;
@@ -496,11 +518,14 @@ static int pcm_wait(void)
 }
 
 /*
- * Acquire USB-owned storage before sampling the source timeline.  The old POC
- * copied 1 ms of PCM first and could then block on a delayed callback, leaving
- * that already-copied packet stale before submission.  A callback now only
- * makes transfer storage reusable; source selection happens after ownership is
- * acquired, so pcm_next() can resync to current Sony PCM.
+ * Order matters: take USB-owned storage first, then sample the source.
+ *
+ * The reverse -- copy 1 ms of PCM, then wait for a free context -- reads as
+ * equivalent and is not.  That wait is unbounded if a completion is delayed,
+ * and the packet copied before it goes stale while we sit in it.  A completion
+ * only makes transfer storage reusable; choosing what to put in that storage
+ * belongs after ownership is held, so pcm_next() always resyncs against
+ * whatever Sony has produced at submission time.
  */
 static int queue_next_source_packet(void)
 {

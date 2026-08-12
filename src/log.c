@@ -12,12 +12,15 @@
 #define UAC_LOG_BUFFER_SIZE 512u
 
 /*
- * The file is opened once and held.  The previous version did open/write/close
- * per line from four threads -- including USBD completion callbacks and the
- * system-event handler -- which is three syscalls per line in contexts that
- * should not be doing file I/O at all, and it demonstrably lost lines during a
- * sysevent burst.  One append write per line still lets concurrent threads
- * interleave, but each line is a single syscall and none are dropped.
+ * The file is opened once at module start and held until module stop.
+ *
+ * Callers include USBD completion callbacks and the system-event handler, which
+ * have no business touching the filesystem at all; one append per line is the
+ * cheapest thing that still works from those contexts.  Resist going back to
+ * open/write/close per line -- three syscalls per line across four threads
+ * drops lines during a sysevent burst, which is precisely when the log is worth
+ * having.  Concurrent lines can still interleave; each one is atomic enough to
+ * read.
  */
 static SceUID log_fd = -1;
 

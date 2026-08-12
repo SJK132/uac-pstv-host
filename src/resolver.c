@@ -1,3 +1,18 @@
+/*
+ * Locating Sony's private audio internals.
+ *
+ * Everything this plugin hooks is unexported: two SceAVConfig functions, a
+ * handful of its private data fields, and three SceAudio RAM-output entry
+ * points.  All are reached by fixed offset from their module's export table.
+ *
+ * Offsets are only safe because both modules' text is byte-identical across
+ * every firmware in known_avconfig[] -- established by diffing the decrypted
+ * modules, not assumed.  The module NID is the one thing that does differ
+ * between builds, which is what makes it usable as the firmware gate: a NID not
+ * in the table is refused outright rather than resolved on faith.  Extending
+ * the range means verifying a new module and adding one row; see the README.
+ */
+
 #include "resolver.h"
 
 #include "log.h"

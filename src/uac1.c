@@ -1,3 +1,19 @@
+/*
+ * USB device lifecycle: descriptor discovery, session setup, session teardown.
+ *
+ * Two things worth knowing before changing anything here.
+ *
+ * Callbacks must not block.  probe/attach/detach run on USBD's own thread, so
+ * setup is a state machine driven by control-transfer completions (CLAIMED ->
+ * SET_CONFIGURATION -> SET_INTERFACE -> SET_RATE -> STREAMING) and teardown is
+ * handed to a dedicated worker.  Anything that can take milliseconds belongs on
+ * that worker, not in a callback.
+ *
+ * Callbacks carry a generation token, never a pointer.  A completion that
+ * arrives after its session was retired sees a changed generation and returns
+ * without touching anything, which is what makes rapid replug safe.
+ */
+
 #include "uac1.h"
 #include "log.h"
 #include "stream.h"
@@ -100,6 +116,17 @@ static uint32_t setup_guard;
 static SceKernelSpinlock session_lock;
 static int retired_device_id = -1;
 static int retired_stream_pipe = -1;
+
+/*
+ * An attach USBD offered while a teardown was still in progress.
+ *
+ * USBD offers a device exactly once.  Refusing an attach therefore loses it for
+ * good: the device stays enumerated with no session behind it, and only a
+ * physical replug brings it back.  Recording the ID and retrying once the setup
+ * gate reopens is what closes that window.  It opens widest coming out of sleep
+ * with audio streaming, since that is when teardown takes longest.
+ */
+static int deferred_attach = -1;
 static uint8_t rate_buffer[64] __attribute__((aligned(64)));
 
 /*
@@ -525,6 +552,8 @@ static int transition_state(
 }
 
 static void try_finalize_cleanup(void);
+static int request_cleanup(uint32_t generation, const char *reason);
+static void interface_done(int32_t result, int32_t count, void *arg);
 
 /*
  * Safe to call spuriously: try_finalize_cleanup() only acts once the setup
@@ -688,6 +717,21 @@ static void release_streaming_interface(int control_pipe)
 		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &matched, &timeout);
 }
 
+/*
+ * Runs on the teardown worker, never on a USBD callback, so re-running setup
+ * here is safe.  If the device really went away while we were asleep the pipe
+ * opens fail and request_cleanup() unwinds normally -- no worse than now.
+ */
+static void retry_deferred_attach(void)
+{
+	int device = __atomic_exchange_n(&deferred_attach, -1, __ATOMIC_ACQ_REL);
+
+	if (device >= 0) {
+		uac_log(LOG_PREFIX "retrying deferred attach: device %d\n", device);
+		(void)uac1_attach(device);
+	}
+}
+
 static void try_finalize_cleanup(void)
 {
 	SceKernelIntrStatus lock_state;
@@ -760,6 +804,7 @@ static void try_finalize_cleanup(void)
 		__atomic_store_n(&active.state, UAC1_STATE_IDLE, __ATOMIC_RELEASE);
 		/* Opening the guard is the final publication step. */
 		__atomic_store_n(&setup_guard, 0, __ATOMIC_RELEASE);
+		retry_deferred_attach();
 	}
 }
 
@@ -800,10 +845,17 @@ static int request_cleanup(uint32_t generation, const char *reason)
 
 /*
  * Suspend is not an unplug: the device is still on the bus, so active.cancelled
- * stays clear.  That matters -- it is what lets try_finalize_cleanup() send
+ * stays clear.  That is what lets try_finalize_cleanup() send
  * SET_INTERFACE(alt 0) before closing the control pipe, so an external DAC is
- * actually told the stream ended rather than being left with the interface
- * nominally active.  Returns immediately; the worker does the blocking part.
+ * told the stream ended rather than being left with the interface nominally
+ * active.  Returns immediately; the worker does the blocking part.
+ *
+ * Sleep does also deliver a real detach, but this beats it: the detach arrives
+ * to find the session already retired and takes the late-detach branch.  That
+ * ordering is the point.  Drop this and the detach wins instead, which sets
+ * cancelled and skips alt 0 -- the device then keeps its clock domain locked to
+ * USB across the sleep, which on a DAC with a switchable clock source is
+ * visible as never falling back to internal.
  */
 void uac1_suspend_session(void)
 {
@@ -813,7 +865,7 @@ void uac1_suspend_session(void)
 		(void)request_cleanup(generation, "system suspend");
 }
 
-/* Re-drive a teardown that suspend interrupted. No-ops when nothing pending. */
+/* Re-drive a teardown that suspend interrupted. No-ops when nothing pends. */
 void uac1_resume_retry(void)
 {
 	signal_teardown();
@@ -979,8 +1031,13 @@ int uac1_attach(int device_id)
 
 	TRACE_CALLBACK(attach_count, "attach callback #%u: device %d\n", device_id);
 
-	if (!setup_enter())
+	if (!setup_enter()) {
+		/* Remember it; try_finalize_cleanup() retries once the gate reopens. */
+		__atomic_store_n(&deferred_attach, device_id, __ATOMIC_RELEASE);
+		uac_log(LOG_PREFIX "attach deferred: device %d, teardown in progress\n",
+			device_id);
 		return SCE_USBD_ATTACH_FAILED;
+	}
 
 	lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
 	if (__atomic_load_n(&active.device_id, __ATOMIC_RELAXED) != -1) {
