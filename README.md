@@ -83,7 +83,7 @@ removed when the stream stops.
 
 A few details that matter if you go reading the source:
 
-- **Latency** is about 22 ms: 10 ms to fill a capture block, ~10 ms because the
+- **Latency** is about 13 ms: 5 ms to fill a capture block, ~6 ms because the
   consumer trails the producer by one block, plus 2 ms of USB contexts. The
   block size is Sony's, not ours.
 - **The staging buffer is latest-wins, not a queue.** The capture worker isn't
