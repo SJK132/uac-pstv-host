@@ -13,37 +13,6 @@ a cable from the TV, or if you want a real DAC in the chain.
 
 It is **output only**. Microphones and headset input are not supported.
 
-## What it touches
-
-Kernel plugins deserve suspicion, so here is exactly what this one does, and
-when.
-
-**With no USB audio device attached, it does nothing at all.** It registers a
-USB driver and waits. `SceAVConfig` is never read, no hooks are installed, and
-no Sony code is touched. Attach a device that isn't UAC1 and that stays true —
-it's declined during probe and nothing further happens.
-
-The two taiHEN hooks go in **only after** a UAC1 device has been probed,
-claimed, configured, had its streaming interface selected and its sample rate
-accepted. They come back out when the stream stops.
-
-**Nothing persists.** The release build writes nothing to storage — no registry
-keys, no flash, no files. Everything it does lives in RAM: two hooks, and writes
-to AVConfig's data segment. A reboot is a complete reset, so there is no state
-that can be left in a bad shape.
-
-**`module_start` cannot fault.** It calls only SDK functions and dereferences no
-computed address, so a wrong offset or an unexpected firmware cannot stop the
-console booting. The code that derives addresses runs only once you attach an
-audio device — which is entirely under your control.
-
-If something does go wrong, remove the line from `config.txt` and reboot.
-
-One known limitation, because a safety section that only brags is worth less:
-if releasing the audio route ever times out, AVConfig can be left mid-transition
-and system audio may stay silent until you reboot. Nothing is written anywhere,
-so a power cycle always restores it — but that is the one case that needs one.
-
 ## Install
 > [!WARNING]
 > **StorageMgr users:** `uac_pstv.skprx` must appear before
@@ -84,6 +53,7 @@ build (below) and look for a `reject ep` line — it names the exact reason.
 
 3.60, 3.61, 3.63, 3.65, 3.67, 3.68, 3.71 and 3.73. PlayStation TV only — the
 plugin checks and unloads itself on a handheld Vita.
+
 
 ## How it works
 
@@ -182,6 +152,37 @@ over the target's entry, so the entry instruction is what moves.
 Refusals are logged with the NID and the reason.
 
 </details>
+
+## What it touches
+
+Kernel plugins deserve suspicion, so here is exactly what this one does, and
+when.
+
+**With no USB audio device attached, it does nothing at all.** It registers a
+USB driver and waits. `SceAVConfig` is never read, no hooks are installed, and
+no Sony code is touched. Attach a device that isn't UAC1 and that stays true —
+it's declined during probe and nothing further happens.
+
+The two taiHEN hooks go in **only after** a UAC1 device has been probed,
+claimed, configured, had its streaming interface selected and its sample rate
+accepted. They come back out when the stream stops.
+
+**Nothing persists.** The release build writes nothing to storage — no registry
+keys, no flash, no files. Everything it does lives in RAM: two hooks, and writes
+to AVConfig's data segment. A reboot is a complete reset, so there is no state
+that can be left in a bad shape.
+
+**`module_start` cannot fault.** It calls only SDK functions and dereferences no
+computed address, so a wrong offset or an unexpected firmware cannot stop the
+console booting. The code that derives addresses runs only once you attach an
+audio device — which is entirely under your control.
+
+If something does go wrong, remove the line from `config.txt` and reboot.
+
+One known limitation, because a safety section that only brags is worth less:
+if releasing the audio route ever times out, AVConfig can be left mid-transition
+and system audio may stay silent until you reboot. Nothing is written anywhere,
+so a power cycle always restores it — but that is the one case that needs one.
 
 ## Source layout
 
