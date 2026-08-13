@@ -45,34 +45,22 @@ and system audio may stay silent until you reboot. Nothing is written anywhere,
 so a power cycle always restores it — but that is the one case that needs one.
 
 ## Install
-
+> [!WARNING]
+> **StorageMgr users:** `uac_pstv.skprx` must appear before
+> `storagemgr.skprx` under `*KERNEL`. Otherwise, the USB audio device may
+> not be detected during boot.
+> 
 1. Copy `uac_pstv.skprx` to `ur0:tai/`.
-2. Add it under the `*KERNEL` section of `ur0:tai/config.txt`, above
-   StorageMgr and any other plugin that registers a USB driver:
-
+2. Add it under the `*KERNEL` section of `ur0:tai/config.txt`
    ```
    *KERNEL
    ur0:tai/uac_pstv.skprx
    ur0:tai/storagemgr.skprx
    ```
-
-   > [!WARNING]
-   > **StorageMgr users:** `uac_pstv.skprx` must appear before
-   > `storagemgr.skprx` under `*KERNEL`. Otherwise, the USB audio device may
-   > not be detected during boot.
-
-   USB drivers are offered a new device in the order they registered, so
-   whichever loads first gets first refusal on it.
-
 3. Reboot.
 
 To uninstall, remove that line and reboot.
 
-If the order is wrong, the symptom is that nothing happens at all — no audio,
-and the device is never probed. That looks exactly like an unsupported device,
-so check the order first. With the logging build, a correct install logs a
-`probe callback` line the moment you attach the device; if that line never
-appears, something else claimed it.
 
 ## Will my device work?
 
