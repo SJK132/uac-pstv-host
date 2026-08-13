@@ -47,17 +47,22 @@ so a power cycle always restores it — but that is the one case that needs one.
 ## Install
 
 1. Copy `uac_pstv.skprx` to `ur0:tai/`.
-2. Add it under the `*KERNEL` section of `ur0:tai/config.txt`.
-
-   **It must be listed above StorageMgr**, and above any other plugin that
-   registers a USB driver. USB drivers are offered a new device in the order
-   they registered, so whichever loads first gets first refusal on it:
+2. Add it under the `*KERNEL` section of `ur0:tai/config.txt`, above
+   StorageMgr and any other plugin that registers a USB driver:
 
    ```
    *KERNEL
    ur0:tai/uac_pstv.skprx
    ur0:tai/storagemgr.skprx
    ```
+
+   > [!WARNING]
+   > **StorageMgr users:** `uac_pstv.skprx` must appear before
+   > `storagemgr.skprx` under `*KERNEL`. Otherwise, the USB audio device may
+   > not be detected during boot.
+
+   USB drivers are offered a new device in the order they registered, so
+   whichever loads first gets first refusal on it.
 
 3. Reboot.
 
@@ -234,6 +239,23 @@ After a full reboot:
 3. Sleep with the device connected, then wake. The device should be told the
    stream ended so an external DAC returns to its internal clock.
 4. Unload the module while the USB device is detached.
+
+## Credits
+
+* OpenAI Codex — driver architecture, implementation, optimization, host-side
+  tests, build tooling, and documentation.
+* Anthropic Claude — the v1.0 rework around AVConfig's RAM-output route and its
+  sleep/wake recovery fixes, plus v1.0.1's latency reduction, feeder
+  scheduling, and a seqlock memory-ordering fix in the PCM handoff.
+* [psvita-usb-audio-midi](https://github.com/intermynd-instruments/psvita-usb-audio-midi)
+  — audio-processing reference work.
+* [TVIKEY](https://github.com/isage/tvikey) and
+  [vita-packages-extra](https://github.com/isage/vita-packages-extra) — Vita
+  USB host examples and packaging support.
+* [vita-udcd-uvc](https://github.com/xerpi/vita-udcd-uvc) and
+  [Vita-USB-Stream](https://github.com/BenMitnicK/Vita-USB-Stream) — prior
+  Vita USB streaming work that informed the investigation.
+* The VitaSDK, taiHEN, HENkaku, Ensō, and StorageMgr contributors.
 
 ## License
 
