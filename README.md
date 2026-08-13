@@ -84,8 +84,7 @@ removed when the stream stops.
 A few details that matter if you go reading the source:
 
 - **Latency** is about 13 ms: 5 ms to fill a capture block, ~6 ms because the
-  consumer trails the producer by one block, plus 2 ms of USB contexts. The
-  block size is Sony's, not ours.
+  consumer trails the producer by one block, plus 2 ms of USB contexts.
 - **The staging buffer is latest-wins, not a queue.** The capture worker isn't
   rate-locked to 48 kHz — it publishes whatever `ram_submit` returns, whenever it
   returns — so a FIFO underneath it thrashes. The seqlock lets the reader snap to
