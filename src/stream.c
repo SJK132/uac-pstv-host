@@ -1184,14 +1184,32 @@ static int usb_feeder_thread(SceSize args, void *argp)
 	if (pcm_started)
 		pcm_end();
 #ifdef UAC_PSTV_ENABLE_LOGGING
-	uac_log(LOG_PREFIX
-		"session: %u packets, %u starved, %u pcm waits, "
-		"%u resyncs, min margin %u blocks\n",
-		__atomic_load_n(&submit_count, __ATOMIC_RELAXED),
-		__atomic_load_n(&starve_count, __ATOMIC_RELAXED),
-		__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED),
-		__atomic_load_n(&resync_count, __ATOMIC_RELAXED),
-		__atomic_load_n(&margin_min, __ATOMIC_RELAXED));
+	{
+		/*
+		 * Still the sentinel means the cursor never read a block -- a session
+		 * that ended inside priming, which a replug storm produces plenty of.
+		 * Printing 4294967295 there reads as a fault rather than as no data.
+		 */
+		uint32_t margin = __atomic_load_n(&margin_min, __ATOMIC_RELAXED);
+
+		if (margin == 0xffffffffu)
+			uac_log(LOG_PREFIX
+				"session: %u packets, %u starved, %u pcm waits, "
+				"%u resyncs, no margin sampled\n",
+				__atomic_load_n(&submit_count, __ATOMIC_RELAXED),
+				__atomic_load_n(&starve_count, __ATOMIC_RELAXED),
+				__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED),
+				__atomic_load_n(&resync_count, __ATOMIC_RELAXED));
+		else
+			uac_log(LOG_PREFIX
+				"session: %u packets, %u starved, %u pcm waits, "
+				"%u resyncs, min margin %u blocks\n",
+				__atomic_load_n(&submit_count, __ATOMIC_RELAXED),
+				__atomic_load_n(&starve_count, __ATOMIC_RELAXED),
+				__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED),
+				__atomic_load_n(&resync_count, __ATOMIC_RELAXED),
+				margin);
+	}
 	uac_log(LOG_PREFIX
 		"queue: %u callbacks without READY, %u short refills, "
 		"min %u/%u in flight, %u late callbacks rejected\n",

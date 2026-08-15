@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2 - 2026-08-15
+
+- Rewrote the session lifecycle around a single owning thread. Setup and
+  teardown are straight-line code now instead of a chain of USB callbacks, which
+  removed the state machine, reference counts and generation tokens that existed
+  only to defend against them.
+- Fixed a device attached before boot never being configured.
+- USB host mode is no longer re-asserted on every system event.
+- Improved system software stability and performance.
+
 ## v1.1 - 2026-08-14
 
 - USB transport is now four fixed 1 ms contexts: three in flight, one staged

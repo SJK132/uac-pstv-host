@@ -95,8 +95,9 @@ A few details that matter if you go reading the source:
   rate-locked to 48 kHz — it publishes whatever `ram_submit` returns, whenever it
   returns — so a FIFO underneath it thrashes. The seqlock lets the reader snap to
   the freshest block instead.
-- **Session teardown runs on its own worker**, never on the USBD callback
-  thread, because releasing the route can take seconds in the worst case and
+- **One thread owns a session end to end** — opening the pipes, the setup
+  control transfers, taking the route, and the whole teardown. USB callbacks
+  only post to it and return, because releasing the route can take seconds and
   blocking a detach callback is what makes rapid replug drop events.
 - **Alternate setting 0** is selected on a clean teardown, so an external DAC is
   told the stream ended and drops back to its internal clock instead of staying
@@ -188,8 +189,8 @@ so a power cycle always restores it — but that is the one case that needs one.
 ## Source layout
 
 - `src/main.c` — module, system-event, and USB-driver lifetime.
-- `src/uac1.c` — UAC1 descriptor parsing, asynchronous device setup, and the
-  session teardown worker.
+- `src/uac1.c` — UAC1 descriptor parsing and the three USB driver callbacks.
+- `src/session.c` — the session thread: device setup, route handover, teardown.
 - `src/stream.c` — 4×240-frame PCM staging, 48-frame packetizer, and the fixed
   four-context scheduler with three USB requests in flight.
 - `src/audio_tap.c` — AVConfig route ownership, native A/B worker, DataSend-start
