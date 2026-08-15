@@ -13,66 +13,23 @@ a cable from the TV, or if you want a real DAC in the chain.
 
 It is **output only**. Microphones and headset input are not supported.
 
-## What it touches
-
-Kernel plugins deserve suspicion, so here is exactly what this one does, and
-when.
-
-**With no USB audio device attached, it does no audio-routing work.** It keeps
-only its USB driver, lifecycle thread and system-event handler registered.
-`SceAVConfig` is never read and no hooks are installed. Attach a device that
-isn't UAC1 and it is declined during probe without touching Sony audio state.
-
-The two taiHEN hooks go in **only after** a UAC1 device has been probed,
-claimed, configured, had its streaming interface selected and its sample rate
-accepted. They come back out after teardown completes successfully; a failed
-teardown keeps them installed so the resident module can retry safely.
-
-**Nothing persists.** The release build writes nothing to storage — no registry
-keys, no flash, no files. Everything it does lives in RAM: two hooks, and writes
-to AVConfig's data segment. A reboot is a complete reset, so there is no state
-that can be left in a bad shape.
-
-**`module_start` does not resolve or dereference private Sony addresses.** A
-wrong profile cannot affect boot: resolution and hook installation happen only
-after a supported UAC1 device has configured successfully.
-
-If something does go wrong, remove the line from `config.txt` and reboot.
-
-One known limitation, because a safety section that only brags is worth less:
-if releasing the audio route ever times out, AVConfig can be left mid-transition
-and system audio may stay silent until you reboot. Nothing is written anywhere,
-so a power cycle always restores it — but that is the one case that needs one.
-
 ## Install
-
+> [!WARNING]
+> **StorageMgr users:** `uac_pstv.skprx` must appear before
+> `storagemgr.skprx` under `*KERNEL`. Otherwise, the USB audio device may
+> not be detected during boot.
+> 
 1. Copy `uac_pstv.skprx` to `ur0:tai/`.
-2. Add it under the `*KERNEL` section of `ur0:tai/config.txt`, above
-   StorageMgr and any other plugin that registers a USB driver:
-
+2. Add it under the `*KERNEL` section of `ur0:tai/config.txt`
    ```
    *KERNEL
    ur0:tai/uac_pstv.skprx
    ur0:tai/storagemgr.skprx
    ```
-
-   > [!WARNING]
-   > **StorageMgr users:** `uac_pstv.skprx` must appear before
-   > `storagemgr.skprx` under `*KERNEL`. Otherwise, the USB audio device may
-   > not be detected during boot.
-
-   USB drivers are offered a new device in the order they registered, so
-   whichever loads first gets first refusal on it.
-
 3. Reboot.
 
 To uninstall, remove that line and reboot.
 
-If the order is wrong, the symptom is that nothing happens at all — no audio,
-and the device is never probed. That looks exactly like an unsupported device,
-so check the order first. With the logging build, a correct install logs a
-`probe callback` line the moment you attach the device; if that line never
-appears, something else claimed it.
 
 ## Will my device work?
 
@@ -99,6 +56,7 @@ PlayStation TV only; the plugin checks and unloads itself on a handheld Vita.
 Unverified firmware (currently 3.69, 3.70, 3.72 and 3.74) is rejected at USB
 attach without installing a hook. Each needs a real `SceAVConfig` module sample
 before it can be added safely.
+
 
 ## How it works
 
@@ -195,6 +153,37 @@ the data base; it is not a general module-integrity scanner.
 Logging builds report an unverified NID and the validation boundary that failed.
 
 </details>
+
+## What it touches
+
+Kernel plugins deserve suspicion, so here is exactly what this one does, and
+when.
+
+**With no USB audio device attached, it does no audio-routing work.** It keeps
+only its USB driver, lifecycle thread and system-event handler registered.
+`SceAVConfig` is never read and no hooks are installed. Attach a device that
+isn't UAC1 and it is declined during probe without touching Sony audio state.
+
+The two taiHEN hooks go in **only after** a UAC1 device has been probed,
+claimed, configured, had its streaming interface selected and its sample rate
+accepted. They come back out after teardown completes successfully; a failed
+teardown keeps them installed so the resident module can retry safely.
+
+**Nothing persists.** The release build writes nothing to storage — no registry
+keys, no flash, no files. Everything it does lives in RAM: two hooks, and writes
+to AVConfig's data segment. A reboot is a complete reset, so there is no state
+that can be left in a bad shape.
+
+**`module_start` does not resolve or dereference private Sony addresses.** A
+wrong profile cannot affect boot: resolution and hook installation happen only
+after a supported UAC1 device has configured successfully.
+
+If something does go wrong, remove the line from `config.txt` and reboot.
+
+One known limitation, because a safety section that only brags is worth less:
+if releasing the audio route ever times out, AVConfig can be left mid-transition
+and system audio may stay silent until you reboot. Nothing is written anywhere,
+so a power cycle always restores it — but that is the one case that needs one.
 
 ## Source layout
 

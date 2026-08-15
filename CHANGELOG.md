@@ -2,77 +2,12 @@
 
 ## v1.1 - 2026-08-14
 
-A state-ownership pass over the whole plugin, one reproducible startup failure
-fixed, and a set of scheduling and memory-layout changes on the 1 ms path. The
-last of these are individually tiny and were nearly dropped as unmeasurable;
-together they are audible as reduced clipping under PSP emulation, which is the
-load case where the console actually runs short of the deadline.
-
-### Fixed
-
-- USB audio refused to start for the rest of the session once the console had
-  used audio input. The receive-worker flag was read from the wrong AVConfig
-  word -- the DataRecv sample rate rather than its active flag -- which stays
-  non-zero after any capture and made route acquisition report the route busy
-  forever. Confirmed against the module's own initialiser, which clears the two
-  worker flags as a pair.
-- A start request arriving inside the teardown window could clear the capture
-  worker's stop flag, leaving it running after the route had been released. Stop
-  and start now order against each other on a single atomic.
-- A completion delayed across a rapid replug could act on context storage a
-  later session had reused. Callbacks now carry an immutable
-  generation-and-index token instead of a context pointer, so a stale one is
-  rejected before anything is dereferenced.
-- Retirement could be claimed twice, letting a late finaliser write a live
-  session back to idle. One CAS now decides the winner.
-- The packetizer's block distance was off by one across the sequence wrap, and
-  a resync at the wrap placed the cursor on the newest block with no margin.
-
-### Transport
-
-- Completions submit the next request before waking the feeder. The wakeup is a
-  kernel call that can reschedule on the spot, and it was running ahead of the
-  submit that has to reach the controller inside the frame.
-- The pump gate is a request counter rather than a boolean. A thread that loses
-  the gate leaves a ticket the owner must consume, so work published just as the
-  owner finished its last scan can no longer be stranded.
-- Autonomous failures -- capture submit, transfer status, PCM wait -- now reach
-  the UAC1 teardown worker. Previously the stream died while the lifecycle stayed
-  in STREAMING with nothing to recover it.
-- Startup silence is sent while route acquisition is polled, instead of leaving
-  an already-selected isochronous endpoint with no requests on it.
-
-### Layout
-
-- Each 192-byte DMA buffer is aligned so it cannot straddle a 4 KiB page, which
-  EHCI would otherwise have to describe with a second buffer-page pointer. It
-  held by accident of where BSS landed; static asserts now make it a guarantee.
-- Shared state is grouped by which thread touches it, with each group padded to
-  own one 32-byte Cortex-A9 reservation granule. The per-millisecond PCM cursor
-  had drifted into the same granule as the two counters the other core does
-  ldrex/strex on every packet, where its plain stores were clearing reservations
-  and forcing CAS retries. Nothing in the source had ever stated the requirement,
-  so nothing warned when a compiler anchor group shifted.
-- Removed a redundant barrier per completion, and the cache clean no longer runs
-  on the abort path.
-
-### Recovery
-
-- Stream, tap and UAC1 teardown fail closed. Worker UIDs, callbacks, hooks,
-  pipes and route ownership are never declared retired before the subsystem that
-  owns them confirms it, and a residual capture-thread UID is now recovered
-  rather than becoming a permanent error.
-- Sony's receive worker is an acquire-time conflict only. Waiting on it to go
-  idle during release would have blocked our own teardown on an unrelated
-  subsystem.
-- Attach, deferred attach and detach hand the session generation over under the
-  existing lock.
-
-### Resolution
-
-- The three SceAudio RAM functions are resolved by exported NID rather than by
-  fixed text offset. Private AVConfig offsets remain gated by verified module
-  NIDs plus an instruction check at each hook site.
+- USB transport is now four fixed 1 ms contexts: three in flight, one staged
+  behind them.
+- Reworked the UAC1 and route-ownership state machines so every handoff has
+  exactly one owner. This fixes a device that would refuse to start for the rest
+  of the session once the console had used audio input.
+- Improved system software stability and performance.
 
 ## v1.0.1 - 2026-08-12
 
