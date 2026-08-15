@@ -16,8 +16,7 @@
  * such a stall, ending up ~50 blocks ahead.  Latest-wins throws the backlog away
  * and resumes at current audio for the price of one discontinuity; a FIFO would
  * queue every stalled block faithfully and add that 250 ms to output latency
- * permanently, again on each stall.  Anyone reaching for a ring buffer here
- * should read that sentence twice.
+ * permanently, again on each stall.
  */
 
 #include "stream.h"
@@ -102,12 +101,6 @@
  * is still in L1 when the feeder reads it back out; on separate cores a 960-byte
  * block is thirty line invalidations, six thousand a second.  (Thirty, not
  * fifteen: this core's line is 32 bytes.  See UAC_ERG.)
- *
- * Stated honestly, because the measurements were noisier than they first looked:
- * the priority change moved the starve rate only slightly and within run-to-run
- * variance, and an A/B against 0x40-unpinned produced identical resync counts,
- * so neither setting is implicated in the USB stalls described at the top of
- * this file.  Compare the session line before and after touching either.
  */
 #define FEEDER_PRIORITY 0x20
 #define FEEDER_CPU_MASK 0x80000u
@@ -458,12 +451,80 @@ static uint32_t resync_gap[RESYNC_LOG_MAX];
 			__ATOMIC_RELAXED, __ATOMIC_RELAXED)) \
 		; \
 } while (0)
+
+/*
+ * Stall census: completions that arrive a very long time after the previous
+ * one, and how the transport stood going into the gap.
+ *
+ * What it established, from a session with four mid-stream stalls:
+ *
+ *   - The gap is one full pass of a 256-entry periodic frame list.  Five
+ *     measurements averaged 255959 us, 41 us under a flat 256 frames, with
+ *     about a frame of scatter either way.
+ *   - Every stall is followed by a resync on the very next packet, so the
+ *     resync count is the stall count and nothing else contributes to it.
+ *     "Producer was 52 blocks ahead" is Sony's capture running on through a
+ *     frozen transport, not a producer fault.
+ *   - The whole pipe freezes, not one descriptor.  The gap is measured
+ *     between any two completions, so a lone stranded request would leave the
+ *     other two completing on schedule and no gap would appear at all.
+ *
+ * That last point is why depth is not a lever here: a fourth request in
+ * flight would freeze alongside the other three.  It also retired the theory
+ * this census was built to test -- that a drained transport strands the next
+ * submit -- since four of the five stalls report zero starves in the gap.
+ *
+ * Only transfer_done() touches this state, and USBD delivers completions on a
+ * single thread, so plain accesses suffice; the counters it samples are
+ * relaxed atomics because pump_ready() also runs on the feeder.
+ */
+#define STALL_LOG_MAX 8u
+#define STALL_THRESHOLD_US 50000u
+static uint32_t completion_at_us;
+static int completion_seen;
+static uint32_t completion_gap_max;
+static uint32_t stall_count;
+static uint32_t stall_at[STALL_LOG_MAX];
+static uint32_t stall_gap[STALL_LOG_MAX];
+static uint32_t stall_starves[STALL_LOG_MAX];
+static uint32_t starve_at_completion;
+
+static void track_completion_gap(void)
+{
+	uint32_t now = ksceKernelGetSystemTimeLow();
+	uint32_t starves = __atomic_load_n(&starve_count, __ATOMIC_RELAXED);
+	uint32_t gap;
+
+	if (!completion_seen) {
+		completion_seen = 1;
+		completion_at_us = now;
+		starve_at_completion = starves;
+		return;
+	}
+	/* Unsigned difference stays correct across the counter's ~71 min wrap. */
+	gap = now - completion_at_us;
+	completion_at_us = now;
+	if (gap > completion_gap_max)
+		completion_gap_max = gap;
+	if (gap >= STALL_THRESHOLD_US) {
+		if (stall_count < STALL_LOG_MAX) {
+			stall_at[stall_count] =
+				__atomic_load_n(&submit_count, __ATOMIC_RELAXED);
+			stall_gap[stall_count] = gap;
+			stall_starves[stall_count] = starves - starve_at_completion;
+		}
+		++stall_count;
+	}
+	starve_at_completion = starves;
+}
+#define TRACK_COMPLETION_GAP() track_completion_gap()
 #else
 #define COUNT_STARVE() ((void)0)
 #define COUNT_SUBMIT() ((void)0)
 #define COUNT_PCM_WAIT() ((void)0)
 #define COUNT_RESYNC(gap) ((void)0)
 #define TRACK_MARGIN(m) ((void)0)
+#define TRACK_COMPLETION_GAP() ((void)0)
 #endif
 
 /* Producer state, written by audio_tap's capture worker. */
@@ -773,6 +834,13 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
 	transfer = (SonyIsoTransfer *)(void *)sdk_transfer;
 	if (__atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) != STREAM_RUNNING)
 		goto out;
+
+	/*
+	 * Before pump_ready(), deliberately.  A starve raised by this callback's
+	 * own drain belongs to the gap that is about to open, not to the one that
+	 * just closed, and sampling it afterwards would misattribute every one.
+	 */
+	TRACK_COMPLETION_GAP();
 
 	status = transfer->packets[0].status;
 	if (result < 0 || status != USBD_CC_NOERR) {
@@ -1165,6 +1233,24 @@ out:
 	}
 	__atomic_store_n(&resync_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&margin_min, 0xffffffffu, __ATOMIC_RELAXED);
+	uac_log(LOG_PREFIX "stalls: %u over %u ms, max completion gap %u us\n",
+		stall_count, STALL_THRESHOLD_US / 1000u, completion_gap_max);
+	{
+		uint32_t shown = stall_count < STALL_LOG_MAX ?
+			stall_count : STALL_LOG_MAX;
+		uint32_t i;
+
+		/*
+		 * "starves in gap" is the whole point of this line: non-zero on
+		 * every stall means the pipe drained first, zero means it did not.
+		 */
+		for (i = 0; i < shown; ++i)
+			uac_log(LOG_PREFIX
+				"  stall %u at packet %u, gap %u us, "
+				"%u starves in gap\n",
+				i + 1u, stall_at[i], stall_gap[i],
+				stall_starves[i]);
+	}
 #endif
 	return 0;
 }
@@ -1268,6 +1354,16 @@ int uac_stream_start(int pipe_id)
 	__atomic_store_n(&refill_short, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&min_in_flight, MAX_IN_FLIGHT, __ATOMIC_RELAXED);
 	__atomic_store_n(&late_callback_count, 0u, __ATOMIC_RELAXED);
+	/*
+	 * completion_seen especially: without it the first completion of this
+	 * session measures its gap against the last one of the previous session
+	 * and invents a stall out of the time the console spent unplugged.
+	 */
+	completion_seen = 0;
+	completion_at_us = 0u;
+	completion_gap_max = 0u;
+	stall_count = 0u;
+	starve_at_completion = 0u;
 #endif
 	memset(contexts, 0, sizeof(contexts));
 
