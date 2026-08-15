@@ -77,6 +77,18 @@ static int unregister_sysevent(void)
 /* Observed PSTV suspend event; duplicate delivery is collapsed below. */
 #define SYSEVENT_SUSPEND 0x0000020fu
 
+/*
+ * suspend_seen gates both halves, and the resume half needs it more.
+ *
+ * A registered handler is called for every system event, and the resume phase
+ * of most of them has nothing to do with sleep -- on hardware they arrive in
+ * the hundreds during ordinary play.  Acting on `resume` alone therefore
+ * re-asserted USB host mode hundreds of times per session and, in logging
+ * builds, buried the log under it.  Requiring a suspend we actually handled
+ * first is both cheaper and more accurate than guessing which event id the
+ * matching resume carries, and it collapses duplicate resume delivery for
+ * free.
+ */
 static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
 {
 	(void)args;
@@ -86,7 +98,8 @@ static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
 	if (resume) {
 		int result;
 
-		__atomic_store_n(&suspend_seen, 0, __ATOMIC_RELEASE);
+		if (!__atomic_exchange_n(&suspend_seen, 0, __ATOMIC_ACQ_REL))
+			return 0;
 		result = ksceUsbServMacSelect(2, 0);
 		uac_log(LOG_PREFIX "USB host resume select: 0x%08x\n", result);
 		(void)result;
