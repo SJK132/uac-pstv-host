@@ -1,10 +1,12 @@
 #ifndef UAC_PSTV_AUDIO_TAP_H
 #define UAC_PSTV_AUDIO_TAP_H
 
-/* Start route acquisition, then poll it without blocking the USB feeder. */
+/*
+ * Take the AVConfig route, and block until it has converged.  Call from the
+ * session thread, after the transport is running: acquisition takes roughly
+ * 400 ms, and the feeder covers that window with silence.
+ */
 int audio_tap_begin(void);
-/* 0: ready, 1: pending, negative: acquisition failed. */
-int audio_tap_poll(void);
 
 /* End one USB session. Resolution and private hooks exist only between these. */
 int audio_tap_end(void);

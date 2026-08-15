@@ -20,7 +20,6 @@
  */
 
 #include "stream.h"
-#include "audio_tap.h"
 #include "log.h"
 #include "uac1.h"
 
@@ -1138,7 +1137,6 @@ static int usb_feeder_thread(SceSize args, void *argp)
 {
 	int expected = FEEDER_STARTING;
 	int pcm_started = 0;
-	int tap_ready = 0;
 	int result;
 
 	(void)args;
@@ -1148,27 +1146,16 @@ static int usb_feeder_thread(SceSize args, void *argp)
 		return -1;
 	if (!uac_stream_is_active())
 		return 0;
-	result = audio_tap_begin();
-	if (result < 0) {
-		uac_log(LOG_PREFIX "virtual Sony DataSend start failed: 0x%08x\n",
-			result);
-		stop_stream(result, USBD_CC_NOERR);
-		goto out;
-	}
-	if (!uac_stream_is_active())
-		goto out;
+	/*
+	 * The route is not this thread's to take.  session.c acquires it after
+	 * this feeder is already running, so the endpoint is fed silence for the
+	 * whole of AVConfig's ~400 ms convergence rather than seeing a gap; PCM
+	 * simply starts arriving partway through, and pcm_next() switches to it.
+	 */
 	pcm_begin();
 	pcm_started = 1;
 
 	while (uac_stream_is_active()) {
-		if (!tap_ready) {
-			result = audio_tap_poll();
-			if (result < 0) {
-				stop_stream(result, USBD_CC_NOERR);
-				break;
-			}
-			tap_ready = result == 0;
-		}
 		result = queue_next_source_packet();
 		if (result == FEED_NEED_PCM) {
 			/*
@@ -1194,11 +1181,6 @@ static int usb_feeder_thread(SceSize args, void *argp)
 			break;
 	}
 
-out:
-	result = audio_tap_end();
-	if (result < 0)
-		uac_log(LOG_PREFIX
-			"virtual Sony DataSend stop failed: 0x%08x\n", result);
 	if (pcm_started)
 		pcm_end();
 #ifdef UAC_PSTV_ENABLE_LOGGING

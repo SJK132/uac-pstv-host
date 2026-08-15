@@ -84,8 +84,6 @@ static volatile int stop_requested;
 static volatile int worker_state;
 static volatile SceUID worker_thread = -1;
 static volatile int worker_result;
-static volatile int acquire_pending;
-static volatile uint32_t acquire_started;
 #ifdef UAC_PSTV_ENABLE_LOGGING
 static volatile uint32_t physical_stop_count;
 #endif
@@ -346,7 +344,6 @@ static int release_route(void)
 		(unsigned int)(ksceKernelGetSystemTimeLow() - start),
 		__atomic_load_n(&physical_stop_count, __ATOMIC_ACQUIRE));
 #endif
-	__atomic_store_n(&acquire_pending, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&virtual_owner, 0, __ATOMIC_RELEASE);
 	return result;
 }
@@ -378,10 +375,54 @@ static int begin_route(void)
 	__atomic_store_n(&virtual_owner, 1, __ATOMIC_RELEASE);
 	audio.cpu_unlock(audio.route_lock, token);
 
-	__atomic_store_n(&acquire_started, ksceKernelGetSystemTimeLow(),
-		__ATOMIC_RELEASE);
-	__atomic_store_n(&acquire_pending, 1, __ATOMIC_RELEASE);
 	return audio.route_wake(ROUTE_WAKE) < 0 ? UAC_TAP_ROUTE_WAKE_FAILED : 0;
+}
+
+/*
+ * Wait for AVConfig to converge on our route.
+ *
+ * Blocking, as it was before v1.0.1 split it into a poll.  That split existed
+ * because the caller was the USB feeder, which has a 1 ms deadline and had to
+ * keep sending silence while it waited.  The caller is now the session thread,
+ * which has no deadline, and the feeder is already running and priming by the
+ * time this starts -- so the wait is nobody's problem.
+ *
+ * The condition is Sony's, not ours: the route word, the selected target, the
+ * transport-ready and dirty flags, and our own send worker must all agree.
+ * recv_worker_active is in here as an acquire-time conflict, unlike in
+ * release_route() where it must not be a condition at all.
+ */
+static int await_route(void)
+{
+	uint32_t start = ksceKernelGetSystemTimeLow();
+
+	for (;;) {
+		int result = __atomic_load_n(&worker_result, __ATOMIC_ACQUIRE);
+		int state = __atomic_load_n(&worker_state, __ATOMIC_ACQUIRE);
+
+		if (result < 0)
+			return result;
+		if ((*audio.route_word & ROUTE_RAM) == ROUTE_RAM &&
+		    *audio.selected_target == ROUTE_RAM &&
+		    *audio.transport_ready == 1u && *audio.route_dirty == 0u &&
+		    *audio.send_worker_active == 1u &&
+		    *audio.recv_worker_active == 0u && state == WORKER_RUNNING &&
+		    __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0 &&
+		    __atomic_load_n(&accept_start, __ATOMIC_ACQUIRE) != 0 &&
+		    __atomic_load_n(&stop_requested, __ATOMIC_ACQUIRE) == 0) {
+			uac_log(LOG_PREFIX "native %u-frame A/B capture active\n",
+				(unsigned int)CAPTURE_FRAMES);
+			return 0;
+		}
+		if (state == WORKER_EXITED ||
+		    (state != WORKER_IDLE && state != WORKER_STARTING &&
+		     state != WORKER_RUNNING))
+			return UAC_TAP_WORKER_BAD_STATE;
+		if ((uint32_t)(ksceKernelGetSystemTimeLow() - start) >
+		    ROUTE_TIMEOUT_US)
+			return UAC_TAP_ACQUIRE_TIMEOUT;
+		ksceKernelDelayThread(ROUTE_POLL_US);
+	}
 }
 
 static int worker_present(void)
@@ -440,50 +481,14 @@ int audio_tap_begin(void)
 
 	result = begin_route();
 	if (result >= 0)
+		result = await_route();
+	if (result >= 0)
 		return 0;
 
 	cleanup_result = cleanup();
 	if (cleanup_result < 0)
 		return cleanup_result;
 	return result;
-}
-
-int audio_tap_poll(void)
-{
-	int state;
-	int result;
-
-	if (!owns_route())
-		return UAC_TAP_WORKER_BAD_STATE;
-	state = __atomic_load_n(&worker_state, __ATOMIC_ACQUIRE);
-	result = __atomic_load_n(&worker_result, __ATOMIC_ACQUIRE);
-	if (result < 0)
-		return result;
-	if ((*audio.route_word & ROUTE_RAM) == ROUTE_RAM &&
-	    *audio.selected_target == ROUTE_RAM &&
-	    *audio.transport_ready == 1u && *audio.route_dirty == 0u &&
-	    *audio.send_worker_active == 1u &&
-	    *audio.recv_worker_active == 0u && state == WORKER_RUNNING &&
-	    __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0 &&
-	    __atomic_load_n(&accept_start, __ATOMIC_ACQUIRE) != 0 &&
-	    __atomic_load_n(&stop_requested, __ATOMIC_ACQUIRE) == 0) {
-		if (__atomic_exchange_n(&acquire_pending, 0,
-			__ATOMIC_ACQ_REL) != 0)
-			uac_log(LOG_PREFIX "native %u-frame A/B capture active\n",
-				(unsigned int)CAPTURE_FRAMES);
-		return 0;
-	}
-	if (state == WORKER_EXITED ||
-	    (state != WORKER_IDLE && state != WORKER_STARTING &&
-	     state != WORKER_RUNNING))
-		return UAC_TAP_WORKER_BAD_STATE;
-	if (__atomic_load_n(&acquire_pending, __ATOMIC_ACQUIRE) == 0)
-		return UAC_TAP_WORKER_BAD_STATE;
-	if ((uint32_t)(ksceKernelGetSystemTimeLow() -
-	    __atomic_load_n(&acquire_started, __ATOMIC_ACQUIRE)) >
-	    ROUTE_TIMEOUT_US)
-		return UAC_TAP_ACQUIRE_TIMEOUT;
-	return 1;
 }
 
 int audio_tap_end(void)

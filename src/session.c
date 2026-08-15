@@ -28,6 +28,7 @@
 
 #include "session.h"
 
+#include "audio_tap.h"
 #include "log.h"
 #include "stream.h"
 #include "uac1.h"
@@ -234,6 +235,11 @@ static void close_session(void)
 		return;
 
 	uac_stream_stop();
+	/* After the feeder is gone, so nothing is still reading captured PCM. */
+	result = audio_tap_end();
+	if (result < 0)
+		uac_log(LOG_PREFIX "virtual Sony DataSend stop failed: 0x%08x\n",
+			result);
 
 	/*
 	 * The transport is told the pipe is gone whether or not USBD agreed to
@@ -337,6 +343,26 @@ static void open_session(int device_id)
 	result = uac_stream_start(live.stream_pipe);
 	if (result < 0) {
 		uac_log(LOG_PREFIX "stream start failed: 0x%08x\n", result);
+		goto fail;
+	}
+
+	/*
+	 * Route last, and only once the transport is running.
+	 *
+	 * AVConfig takes roughly 400 ms to hand the route over, and the streaming
+	 * interface is already selected by now, so the endpoint is live and
+	 * expecting a packet every millisecond throughout.  Starting the transport
+	 * first means the feeder covers that window with silence and the device
+	 * never sees a gap; PCM simply starts arriving partway through.
+	 *
+	 * It also keeps the route out of the failure paths above: nothing before
+	 * this point has taken anything of Sony's, so a device that fails setup
+	 * costs system audio nothing.
+	 */
+	result = audio_tap_begin();
+	if (result < 0) {
+		uac_log(LOG_PREFIX "virtual Sony DataSend start failed: 0x%08x\n",
+			result);
 		goto fail;
 	}
 	return;
