@@ -6,24 +6,15 @@
  * all of it back down.  USBD callbacks and the system-event handler do nothing
  * but post a command here and return.
  *
- * That single owner is the whole design, and it is what removes the machinery
- * this file replaces.  When setup ran as a chain of USBD completion callbacks,
- * every callback had to prove three things before touching anything: that the
- * module was not unloading, that its session had not been replaced underneath
- * it, and that it was still the step it thought it was.  That cost a refcount
- * with a closing bit, a generation token per callback, and a nine-state enum.
- * Running the same steps in order on one thread makes all three structural --
- * there is no interleaving left to defend against.
+ * One owner is the whole design: steps run in order on one thread, so no step
+ * has to prove the session is still the one it started on.
  *
- * Two hazards survive the change, and only two:
+ * Two hazards survive that, and only two:
  *
  *   - A control transfer that times out leaves its completion in flight.  Each
- *     carries a token and drops itself once the token moves on, so a late
- *     completion can never land on the next transfer's result.
- *   - USBD offers a device exactly once.  An attach arriving during a teardown
- *     must not be refused, or the device stays enumerated with no session
- *     behind it until someone replugs it.  It is queued instead, and runs when
- *     the teardown ahead of it finishes.
+ *     carries a token and drops itself once the token moves on.
+ *   - USBD offers a device exactly once, so an attach arriving during a
+ *     teardown is queued behind it, never refused.
  */
 
 #include "session.h"
@@ -120,12 +111,8 @@ static int cancelled(void)
 
 static void control_done(int32_t result, int32_t count, void *arg)
 {
-	/*
-	 * The token is what makes a timeout safe.  control_wait() moves it on
-	 * before giving up, so a completion that arrives afterwards finds a token
-	 * that no longer matches and drops itself rather than reporting into the
-	 * next transfer's result.
-	 */
+	/* control_wait() moves the token on before giving up, so a completion that
+	 * arrives after a timeout drops itself instead of reporting into the next. */
 	if ((uint32_t)(uintptr_t)arg !=
 	    __atomic_load_n(&control_token, __ATOMIC_ACQUIRE))
 		return;
@@ -215,13 +202,9 @@ static int set_sample_rate(void)
 }
 
 /*
- * Tear down whatever open_session() managed to build, in the reverse order it
- * built it.  Safe on a session that never got past its first pipe, and safe to
- * call twice, because every resource is checked before it is released.
- *
- * uac_stream_stop() is the long pole: it reaps the feeder, which releases the
- * AVConfig route on its way out and can take the better part of a second.  That
- * is exactly why this runs here and not on a USBD callback thread.
+ * Unwind whatever open_session() built, in reverse.  Safe on a partial session
+ * and safe to call twice; every resource is checked first.  uac_stream_stop()
+ * can take the better part of a second, which is why this is not on a callback.
  */
 static void close_session(void)
 {
@@ -242,12 +225,9 @@ static void close_session(void)
 			result);
 
 	/*
-	 * The transport is told the pipe is gone whether or not USBD agreed to
-	 * close it.  That is a change from the version this replaces, which held a
-	 * failed close pending in the hope a later detach would clear it.  A pipe
-	 * we could not close is a USBD-side leak that holding an integer does not
-	 * fix, and uac_stream_pipe_closed() bumps the transport generation, which
-	 * is what actually makes any late completion on it harmless.
+	 * Told to the transport whether or not USBD agreed to close it: the
+	 * generation bump inside is what makes a late completion harmless, and
+	 * holding a pipe we could not close fixes nothing.
 	 */
 	if (live.stream_pipe >= 0) {
 		result = ksceUsbdClosePipe(live.stream_pipe);
@@ -277,11 +257,8 @@ static void close_session(void)
 }
 
 /*
- * Bring a session up.  Straight-line, because it owns the thread it runs on.
- *
- * Every failure takes the same exit: post a stop to ourselves and return.  The
- * loop picks it up on the next pass and unwinds through close_session(), so
- * there is exactly one teardown path no matter which step failed.
+ * Bring a session up.  Every failure posts a stop to ourselves and returns, so
+ * one teardown path serves all of them.
  */
 static void open_session(int device_id)
 {
@@ -347,17 +324,9 @@ static void open_session(int device_id)
 	}
 
 	/*
-	 * Route last, and only once the transport is running.
-	 *
-	 * AVConfig takes roughly 400 ms to hand the route over, and the streaming
-	 * interface is already selected by now, so the endpoint is live and
-	 * expecting a packet every millisecond throughout.  Starting the transport
-	 * first means the feeder covers that window with silence and the device
-	 * never sees a gap; PCM simply starts arriving partway through.
-	 *
-	 * It also keeps the route out of the failure paths above: nothing before
-	 * this point has taken anything of Sony's, so a device that fails setup
-	 * costs system audio nothing.
+	 * Route last.  The endpoint is live from here on, and AVConfig takes ~400 ms
+	 * to hand over, so the transport must already be running to cover that with
+	 * silence.  It also keeps the route out of every failure path above.
 	 */
 	result = audio_tap_begin();
 	if (result < 0) {

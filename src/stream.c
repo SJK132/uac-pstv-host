@@ -448,30 +448,14 @@ static uint32_t resync_gap[RESYNC_LOG_MAX];
 } while (0)
 
 /*
- * Stall census: completions that arrive a very long time after the previous
- * one, and how the transport stood going into the gap.
+ * Completions arriving a very long time after the previous one.  Measured at
+ * one full pass of a 256-entry periodic frame list, freezing the whole pipe
+ * rather than one descriptor, and each one followed by a resync.  Depth is
+ * therefore not a lever: a fourth request in flight would freeze with the rest.
  *
- * What it established, from a session with four mid-stream stalls:
- *
- *   - The gap is one full pass of a 256-entry periodic frame list.  Five
- *     measurements averaged 255959 us, 41 us under a flat 256 frames, with
- *     about a frame of scatter either way.
- *   - Every stall is followed by a resync on the very next packet, so the
- *     resync count is the stall count and nothing else contributes to it.
- *     "Producer was 52 blocks ahead" is Sony's capture running on through a
- *     frozen transport, not a producer fault.
- *   - The whole pipe freezes, not one descriptor.  The gap is measured
- *     between any two completions, so a lone stranded request would leave the
- *     other two completing on schedule and no gap would appear at all.
- *
- * That last point is why depth is not a lever here: a fourth request in
- * flight would freeze alongside the other three.  It also retired the theory
- * this census was built to test -- that a drained transport strands the next
- * submit -- since four of the five stalls report zero starves in the gap.
- *
- * Only transfer_done() touches this state, and USBD delivers completions on a
- * single thread, so plain accesses suffice; the counters it samples are
- * relaxed atomics because pump_ready() also runs on the feeder.
+ * Only transfer_done() touches this, on USBD's single callback thread, so plain
+ * accesses suffice; the counters it samples are relaxed atomics because
+ * pump_ready() also runs on the feeder.
  */
 #define STALL_LOG_MAX 8u
 #define STALL_THRESHOLD_US 50000u
@@ -1311,11 +1295,8 @@ int uac_stream_start(int pipe_id)
 	__atomic_store_n(&cur.write_sequence, 0u, __ATOMIC_RELEASE);
 	__atomic_store_n(&tx.primed, 0, __ATOMIC_RELEASE);
 #ifdef UAC_PSTV_ENABLE_LOGGING
-	/*
-	 * completion_seen especially: without it the first completion of this
-	 * session measures its gap against the last one of the previous session
-	 * and invents a stall out of the time the console spent unplugged.
-	 */
+	/* completion_seen especially, or session one's last completion becomes
+	 * session two's baseline and the unplug time reads as a stall. */
 	completion_seen = 0;
 	completion_at_us = 0u;
 	completion_gap_max = 0u;

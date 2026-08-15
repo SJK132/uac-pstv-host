@@ -65,13 +65,7 @@ _Static_assert(CAPTURE_FRAMES <= 512u,
 #define UAC_TAP_START_REFUSED ((int)0x80A10008)
 #define UAC_TAP_HOOK_RELEASE_FAILED ((int)0x80A10009)
 
-/*
- * IDLE covers "no worker" and "a thread that was created but never started" --
- * worker_thread tells those apart, and worker_result carries why.  There is no
- * separate state for the latter because there is nothing a separate state could
- * say: a failed ksceKernelStartThread() always leaves the UID set, so the only
- * branch that distinguished them was unreachable.
- */
+/* IDLE also covers a thread created but never started; worker_thread says which. */
 enum {
 	WORKER_IDLE = 0,
 	WORKER_STARTING,
@@ -93,21 +87,8 @@ static volatile int worker_result;
 #ifdef UAC_PSTV_ENABLE_LOGGING
 static volatile uint32_t physical_stop_count;
 /*
- * How many times Sony enters our DataSend start hook in one session.
- *
- * This decides the fate of accept_start and the stop_requested handshake around
- * it.  That guard exists because start_capture() runs on Sony's thread at a
- * moment we do not choose, and it clears stop_requested -- so a start landing
- * after stop_capture() has set it would undo the stop, strand the capture
- * worker, and make release_route() burn its full timeout.  Real mechanism,
- * never once observed.
- *
- * If this reads 1 every session then the only start is the one we provoke at
- * acquisition, the window closes long before teardown, and the guard is dead
- * code.  If it ever exceeds 1 -- AVConfig restarting its send worker mid
- * session, which is exactly what a PSP emulator launch might do -- the guard is
- * load-bearing and stays.  Do not remove it on argument; remove it on this
- * number.
+ * Sony's entries into our start hook, per session.  If this is always 1 the
+ * accept_start guard below is dead code; above 1 it is load-bearing.
  */
 static volatile uint32_t send_start_count;
 #endif
@@ -315,17 +296,11 @@ static int install_hooks(void)
 }
 
 /*
- * Where AVConfig's route currently stands, from the five words that describe
- * it.  All three callers used to spell this test out themselves, in three
- * slightly different shapes, which made the one thing worth noticing about it
- * easy to miss:
+ * Where AVConfig's route stands, from the five words that describe it.
  *
- * recv_worker_active is deliberately NOT part of this.  It belongs to an
- * independent Sony path, and it is a legitimate reason to refuse to *take* the
- * route -- but it can never be a condition for having *released* it, because
- * Sony may start a receive worker at any time and we would then wait for
- * something that is none of our business.  Callers that care add it themselves,
- * and only begin_route() and await_route() do.
+ * recv_worker_active is deliberately not one of them: it is a fair reason to
+ * refuse to take the route, but never a condition for having released it, since
+ * Sony may start a receive worker at any time.  Callers add it themselves.
  */
 typedef enum {
 	ROUTE_NEUTRAL = 0,	/* nothing of ours set; Sony has it back */
