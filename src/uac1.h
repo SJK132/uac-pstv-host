@@ -1,20 +1,32 @@
 #ifndef UAC_PSTV_UAC1_H
 #define UAC_PSTV_UAC1_H
 
-/* Init before USB registration. Quiesce before unregister; accept rolls back a
- * failed unregister. Shutdown succeeds only after unregister and retirement. */
-int uac1_lifecycle_init(void);
-int uac1_lifecycle_shutdown(void);
-void uac1_lifecycle_quiesce(void);
-void uac1_lifecycle_accept(void);
+#include <stdint.h>
 
-/* Retire the live session on the teardown worker. Never blocks. */
-void uac1_suspend_session(void);
-void uac1_resume_retry(void);
-void uac1_stream_failed(void);
+#include <psp2kern/usbd.h>
 
+/* What the descriptor walk found: the one AS interface we know how to drive. */
+typedef struct {
+	uint8_t configuration;
+	uint8_t interface_number;
+	uint8_t alternate_setting;
+	uint8_t endpoint_address;
+	uint8_t interval;
+	uint8_t speed;
+	uint8_t frequency_control;
+	uint16_t max_packet_size;
+	SceUsbdEndpointDescriptor *endpoint;
+} Uac1Stream;
+
+/* Walk a device's descriptors for a stream this transport can drive. */
+int uac1_find_stream(int device_id, Uac1Stream *found);
+
+/* USBD driver callbacks. Each one posts to the session thread and returns. */
 int uac1_probe(int device_id);
 int uac1_attach(int device_id);
 int uac1_detach(int device_id);
+
+/* Reported by the transport when a live stream fails. Never blocks. */
+void uac1_stream_failed(void);
 
 #endif

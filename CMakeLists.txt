@@ -41,6 +41,7 @@ set(CMAKE_C_EXTENSIONS ON)
 add_executable(uac_pstv_kernel
   src/main.c
   src/uac1.c
+  src/session.c
   src/stream.c
   src/audio_tap.c
   src/resolver.c

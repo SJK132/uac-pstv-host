@@ -1,15 +1,16 @@
 /*
  * Module entry points and system-wide lifecycle.
  *
- * Start order is dependency order -- stream, then the uac1 teardown worker,
- * then the USB driver -- and stop reverses it, so nothing can ever be called
- * back into after it has been torn down.  audio_tap deliberately does not
- * appear in that sequence: it is owned by the feeder thread and lives exactly
- * as long as one USB session.
+ * Start order is dependency order -- stream, then the session thread, then the
+ * USB driver -- and stop reverses it, so nothing can ever be called back into
+ * after it has been torn down.  audio_tap deliberately does not appear in that
+ * sequence: it is owned by the feeder thread and lives exactly as long as one
+ * USB session.
  */
 
 #include "audio_tap.h"
 #include "log.h"
+#include "session.h"
 #include "stream.h"
 #include "uac1.h"
 
@@ -90,13 +91,12 @@ static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
 		uac_log(LOG_PREFIX "USB host resume select: 0x%08x\n", result);
 		(void)result;
 		/*
-		 * Suspend may have cut a teardown short before the worker was
-		 * scheduled.  Poking it is cheap and no-ops when idle.
+		 * Nothing to re-drive: a teardown suspend interrupted is still the
+		 * session thread's current command and resumes with it.
 		 */
-		uac1_resume_retry();
 	} else if ((uint32_t)eventid == SYSEVENT_SUSPEND &&
 		!__atomic_exchange_n(&suspend_seen, 1, __ATOMIC_ACQ_REL)) {
-		uac1_suspend_session();
+		session_stop("system suspend");
 	}
 	return 0;
 }
@@ -106,9 +106,9 @@ static int fail_start(void)
 {
 	int safe = 1;
 
-	uac1_lifecycle_quiesce();
+	session_quiesce();
 	if (unregister_usb_driver() < 0) {
-		uac1_lifecycle_accept();
+		session_accept();
 		__atomic_store_n(&started, 1, __ATOMIC_RELEASE);
 		return SCE_KERNEL_START_SUCCESS;
 	}
@@ -116,7 +116,7 @@ static int fail_start(void)
 	 * may still be retired safely and module_stop can retry its unregister. */
 	if (unregister_sysevent() < 0)
 		safe = 0;
-	if (uac1_lifecycle_shutdown() < 0)
+	if (session_shutdown() < 0)
 		safe = 0;
 	if (safe && uac_stream_shutdown() < 0)
 		safe = 0;
@@ -173,10 +173,10 @@ int module_start(SceSize args, const void *argp)
 	}
 
 	/* The teardown worker must exist before any callback can request it. */
-	result = uac1_lifecycle_init();
+	result = session_init();
 	if (result < 0) {
-		uac1_lifecycle_quiesce();
-		if (uac1_lifecycle_shutdown() < 0 ||
+		session_quiesce();
+		if (session_shutdown() < 0 ||
 		    uac_stream_shutdown() < 0) {
 			uac_log(LOG_PREFIX
 				"lifecycle rollback incomplete; staying resident\n");
@@ -212,18 +212,18 @@ int module_stop(SceSize args, const void *argp)
 	(void)args;
 	(void)argp;
 	__atomic_store_n(&started, 0, __ATOMIC_RELEASE);
-	uac1_lifecycle_quiesce();
+	session_quiesce();
 
 	usb_result = unregister_usb_driver();
 	if (usb_result < 0) {
-		uac1_lifecycle_accept();
+		session_accept();
 		__atomic_store_n(&started, 1, __ATOMIC_RELEASE);
 		return SCE_KERNEL_STOP_FAIL;
 	}
 	if (unregister_sysevent() < 0)
 		return SCE_KERNEL_STOP_FAIL;
 	/* Driver and sysevent are gone, so no new teardown can be queued. */
-	lifecycle_result = uac1_lifecycle_shutdown();
+	lifecycle_result = session_shutdown();
 	if (lifecycle_result < 0)
 		return SCE_KERNEL_STOP_FAIL;
 	stream_result = uac_stream_shutdown();
