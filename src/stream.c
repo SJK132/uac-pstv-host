@@ -417,10 +417,6 @@ static uint32_t submit_count;
 static uint32_t pcm_wait_count;
 static uint32_t resync_count;
 static uint32_t margin_min = 0xffffffffu;
-static uint32_t callback_no_ready;
-static uint32_t refill_short;
-static uint32_t min_in_flight = MAX_IN_FLIGHT;
-static uint32_t late_callback_count;
 #define COUNT_STARVE() __atomic_add_fetch(&starve_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_SUBMIT() __atomic_add_fetch(&submit_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_PCM_WAIT() __atomic_add_fetch(&pcm_wait_count, 1u, __ATOMIC_RELAXED)
@@ -816,19 +812,10 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
 	SonyIsoTransfer *transfer;
 	uint16_t status;
 	int entered;
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	int had_ready;
-#endif
 
 	entered = callback_enter(generation);
-	if (entered <= 0) {
-#ifdef UAC_PSTV_ENABLE_LOGGING
-		if (entered < 0)
-			__atomic_add_fetch(&late_callback_count, 1u,
-				__ATOMIC_RELAXED);
-#endif
+	if (entered <= 0)
 		return;
-	}
 	context = &contexts[token & CALLBACK_CONTEXT_MASK];
 	transfer = (SonyIsoTransfer *)(void *)sdk_transfer;
 	if (__atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) != STREAM_RUNNING)
@@ -847,9 +834,6 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
 		goto out;
 	}
 
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	had_ready = any_context_in(CONTEXT_READY);
-#endif
 	__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
 	/*
 	 * RELEASE rather than ACQ_REL, and the difference is one dmb per
@@ -881,21 +865,6 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
 	 */
 	(void)pump_ready();
 	publish_free_context();
-#ifdef UAC_PSTV_ENABLE_LOGGING
-	{
-		uint32_t depth = __atomic_load_n(&tx.in_flight, __ATOMIC_RELAXED);
-		uint32_t old = __atomic_load_n(&min_in_flight, __ATOMIC_RELAXED);
-
-		if (!had_ready)
-			__atomic_add_fetch(&callback_no_ready, 1u, __ATOMIC_RELAXED);
-		if (depth < MAX_IN_FLIGHT)
-			__atomic_add_fetch(&refill_short, 1u, __ATOMIC_RELAXED);
-		while (depth < old &&
-		       !__atomic_compare_exchange_n(&min_in_flight, &old, depth, 1,
-				__ATOMIC_RELAXED, __ATOMIC_RELAXED))
-			;
-	}
-#endif
 
 out:
 	callback_leave();
@@ -1210,14 +1179,6 @@ static int usb_feeder_thread(SceSize args, void *argp)
 				__atomic_load_n(&resync_count, __ATOMIC_RELAXED),
 				margin);
 	}
-	uac_log(LOG_PREFIX
-		"queue: %u callbacks without READY, %u short refills, "
-		"min %u/%u in flight, %u late callbacks rejected\n",
-		__atomic_load_n(&callback_no_ready, __ATOMIC_RELAXED),
-		__atomic_load_n(&refill_short, __ATOMIC_RELAXED),
-		__atomic_load_n(&min_in_flight, __ATOMIC_RELAXED),
-		MAX_IN_FLIGHT,
-		__atomic_load_n(&late_callback_count, __ATOMIC_RELAXED));
 	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&starve_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&pcm_wait_count, 0u, __ATOMIC_RELAXED);
@@ -1350,10 +1311,6 @@ int uac_stream_start(int pipe_id)
 	__atomic_store_n(&cur.write_sequence, 0u, __ATOMIC_RELEASE);
 	__atomic_store_n(&tx.primed, 0, __ATOMIC_RELEASE);
 #ifdef UAC_PSTV_ENABLE_LOGGING
-	__atomic_store_n(&callback_no_ready, 0u, __ATOMIC_RELAXED);
-	__atomic_store_n(&refill_short, 0u, __ATOMIC_RELAXED);
-	__atomic_store_n(&min_in_flight, MAX_IN_FLIGHT, __ATOMIC_RELAXED);
-	__atomic_store_n(&late_callback_count, 0u, __ATOMIC_RELAXED);
 	/*
 	 * completion_seen especially: without it the first completion of this
 	 * session measures its gap against the last one of the previous session

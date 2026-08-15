@@ -65,10 +65,16 @@ _Static_assert(CAPTURE_FRAMES <= 512u,
 #define UAC_TAP_START_REFUSED ((int)0x80A10008)
 #define UAC_TAP_HOOK_RELEASE_FAILED ((int)0x80A10009)
 
+/*
+ * IDLE covers "no worker" and "a thread that was created but never started" --
+ * worker_thread tells those apart, and worker_result carries why.  There is no
+ * separate state for the latter because there is nothing a separate state could
+ * say: a failed ksceKernelStartThread() always leaves the UID set, so the only
+ * branch that distinguished them was unreachable.
+ */
 enum {
 	WORKER_IDLE = 0,
 	WORKER_STARTING,
-	WORKER_DORMANT,
 	WORKER_RUNNING,
 	WORKER_EXITED,
 };
@@ -86,6 +92,24 @@ static volatile SceUID worker_thread = -1;
 static volatile int worker_result;
 #ifdef UAC_PSTV_ENABLE_LOGGING
 static volatile uint32_t physical_stop_count;
+/*
+ * How many times Sony enters our DataSend start hook in one session.
+ *
+ * This decides the fate of accept_start and the stop_requested handshake around
+ * it.  That guard exists because start_capture() runs on Sony's thread at a
+ * moment we do not choose, and it clears stop_requested -- so a start landing
+ * after stop_capture() has set it would undo the stop, strand the capture
+ * worker, and make release_route() burn its full timeout.  Real mechanism,
+ * never once observed.
+ *
+ * If this reads 1 every session then the only start is the one we provoke at
+ * acquisition, the window closes long before teardown, and the guard is dead
+ * code.  If it ever exceeds 1 -- AVConfig restarting its send worker mid
+ * session, which is exactly what a PSP emulator launch might do -- the guard is
+ * load-bearing and stays.  Do not remove it on argument; remove it on this
+ * number.
+ */
+static volatile uint32_t send_start_count;
 #endif
 
 static int owns_route(void)
@@ -158,6 +182,9 @@ static int start_capture(uint32_t mac0, uint32_t mac1, uint32_t flags)
 
 	if (!owns_route())
 		return TAI_CONTINUE(int, send_start_ref, mac0, mac1, flags);
+#ifdef UAC_PSTV_ENABLE_LOGGING
+	__atomic_add_fetch(&send_start_count, 1u, __ATOMIC_RELAXED);
+#endif
 	if (!__atomic_load_n(&accept_start, __ATOMIC_ACQUIRE))
 		return UAC_TAP_START_REFUSED;
 	if (!__atomic_compare_exchange_n(&worker_state, &expected,
@@ -194,7 +221,7 @@ static int start_capture(uint32_t mac0, uint32_t mac1, uint32_t flags)
 		*audio.send_worker_active = 0u;
 		__atomic_store_n(&worker_result, result, __ATOMIC_RELEASE);
 		/* Keep the UID until cleanup confirms that deletion succeeded. */
-		__atomic_store_n(&worker_state, WORKER_DORMANT, __ATOMIC_RELEASE);
+		__atomic_store_n(&worker_state, WORKER_IDLE, __ATOMIC_RELEASE);
 	}
 	return result;
 }
@@ -218,14 +245,12 @@ static int stop_capture(void)
 		ksceKernelDelayThread(ROUTE_POLL_US);
 	}
 	thread = __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE);
-	if (state == WORKER_IDLE || state == WORKER_DORMANT) {
+	if (state == WORKER_IDLE) {
 		if (thread >= 0) {
 			result = ksceKernelDeleteThread(thread);
 			if (result < 0)
 				return result;
 			__atomic_store_n(&worker_thread, -1, __ATOMIC_RELEASE);
-		} else if (state == WORKER_DORMANT) {
-			return UAC_TAP_WORKER_NO_THREAD;
 		}
 		__atomic_store_n(&worker_state, WORKER_IDLE, __ATOMIC_RELEASE);
 		*audio.send_worker_active = 0u;
@@ -289,6 +314,40 @@ static int install_hooks(void)
 	return result;
 }
 
+/*
+ * Where AVConfig's route currently stands, from the five words that describe
+ * it.  All three callers used to spell this test out themselves, in three
+ * slightly different shapes, which made the one thing worth noticing about it
+ * easy to miss:
+ *
+ * recv_worker_active is deliberately NOT part of this.  It belongs to an
+ * independent Sony path, and it is a legitimate reason to refuse to *take* the
+ * route -- but it can never be a condition for having *released* it, because
+ * Sony may start a receive worker at any time and we would then wait for
+ * something that is none of our business.  Callers that care add it themselves,
+ * and only begin_route() and await_route() do.
+ */
+typedef enum {
+	ROUTE_NEUTRAL = 0,	/* nothing of ours set; Sony has it back */
+	ROUTE_OURS,		/* converged on RAM output with our worker up */
+	ROUTE_MOVING,		/* partway between the two */
+} RouteState;
+
+static RouteState route_state(void)
+{
+	int ram = (*audio.route_word & ROUTE_RAM) != 0u;
+	int target = *audio.selected_target == ROUTE_RAM;
+	int ready = *audio.transport_ready != 0u;
+	int dirty = *audio.route_dirty != 0u;
+	int sending = *audio.send_worker_active != 0u;
+
+	if (!ram && !target && !ready && !dirty && !sending)
+		return ROUTE_NEUTRAL;
+	if (ram && target && ready && !dirty && sending)
+		return ROUTE_OURS;
+	return ROUTE_MOVING;
+}
+
 static int release_route(void)
 {
 	uint32_t token;
@@ -312,37 +371,32 @@ static int release_route(void)
 		return UAC_TAP_ROUTE_WAKE_FAILED;
 
 	/*
-	 * The release is complete when the route and the send worker we own are
-	 * neutral again.  recv_worker_active belongs to an independent Sony path:
-	 * it is a valid acquire-time conflict, but cannot be a release condition.
-	 *
-	 * Waiting on physical_stop_count as a fifth condition is tempting -- it
+	 * Waiting on physical_stop_count as a further condition is tempting -- it
 	 * would mean Sony had acknowledged the teardown through the device-stop
 	 * wrapper we hook.  Do not add it.  stop_capture() above has already
 	 * cleared send_worker_active, so Sony is entitled to conclude there is
 	 * nothing running to stop and never call that wrapper at all.  When it
 	 * makes that choice the condition can never be satisfied and the loop
 	 * spends the entire ROUTE_TIMEOUT_US before giving up -- a second during
-	 * which any incoming attach has to be deferred.  Logging builds maintain
-	 * the count for diagnosis, but release never pays for it.
+	 * which any incoming attach has to wait.  Logging builds maintain the
+	 * count for diagnosis, but release never pays for it.
 	 *
 	 * A timeout retains ownership, hooks and the resolved layout so shutdown
 	 * can retry without unloading code or pointers still needed by AVConfig.
 	 */
 	start = ksceKernelGetSystemTimeLow();
-	while (*audio.selected_target == ROUTE_RAM ||
-	       (*audio.route_word & ROUTE_RAM) != 0u ||
-	       *audio.transport_ready != 0u || *audio.route_dirty != 0u ||
-	       *audio.send_worker_active != 0u) {
+	while (route_state() != ROUTE_NEUTRAL) {
 		if ((uint32_t)(ksceKernelGetSystemTimeLow() - start) >
 		    ROUTE_TIMEOUT_US)
 			return UAC_TAP_RELEASE_TIMEOUT;
 		ksceKernelDelayThread(ROUTE_POLL_US);
 	}
 #ifdef UAC_PSTV_ENABLE_LOGGING
-	uac_log(LOG_PREFIX "route released in %u us, %u physical stops\n",
+	uac_log(LOG_PREFIX
+		"route released in %u us, %u physical stops, %u start hooks\n",
 		(unsigned int)(ksceKernelGetSystemTimeLow() - start),
-		__atomic_load_n(&physical_stop_count, __ATOMIC_ACQUIRE));
+		__atomic_load_n(&physical_stop_count, __ATOMIC_ACQUIRE),
+		__atomic_load_n(&send_start_count, __ATOMIC_ACQUIRE));
 #endif
 	__atomic_store_n(&virtual_owner, 0, __ATOMIC_RELEASE);
 	return result;
@@ -356,15 +410,14 @@ static int begin_route(void)
 	    __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0)
 		return UAC_TAP_WORKER_BAD_STATE;
 	token = audio.cpu_lock(audio.route_lock);
-	if ((*audio.route_word & ROUTE_RAM) != 0u ||
-	    *audio.selected_target == ROUTE_RAM || *audio.transport_ready != 0u ||
-	    *audio.route_dirty != 0u || *audio.send_worker_active != 0u ||
-	    *audio.recv_worker_active != 0u) {
+	/* recv_worker_active is an acquire-time conflict only; see route_state(). */
+	if (route_state() != ROUTE_NEUTRAL || *audio.recv_worker_active != 0u) {
 		audio.cpu_unlock(audio.route_lock, token);
 		return UAC_TAP_ROUTE_BUSY;
 	}
 #ifdef UAC_PSTV_ENABLE_LOGGING
 	__atomic_store_n(&physical_stop_count, 0u, __ATOMIC_RELAXED);
+	__atomic_store_n(&send_start_count, 0u, __ATOMIC_RELAXED);
 #endif
 	__atomic_store_n(&worker_result, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&stop_requested, 1, __ATOMIC_RELEASE);
@@ -387,10 +440,6 @@ static int begin_route(void)
  * which has no deadline, and the feeder is already running and priming by the
  * time this starts -- so the wait is nobody's problem.
  *
- * The condition is Sony's, not ours: the route word, the selected target, the
- * transport-ready and dirty flags, and our own send worker must all agree.
- * recv_worker_active is in here as an acquire-time conflict, unlike in
- * release_route() where it must not be a condition at all.
  */
 static int await_route(void)
 {
@@ -402,10 +451,7 @@ static int await_route(void)
 
 		if (result < 0)
 			return result;
-		if ((*audio.route_word & ROUTE_RAM) == ROUTE_RAM &&
-		    *audio.selected_target == ROUTE_RAM &&
-		    *audio.transport_ready == 1u && *audio.route_dirty == 0u &&
-		    *audio.send_worker_active == 1u &&
+		if (route_state() == ROUTE_OURS &&
 		    *audio.recv_worker_active == 0u && state == WORKER_RUNNING &&
 		    __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0 &&
 		    __atomic_load_n(&accept_start, __ATOMIC_ACQUIRE) != 0 &&
