@@ -77,6 +77,7 @@ typedef enum {
 	UAC1_STATE_STREAMING,
 	UAC1_STATE_CLEANING,
 	UAC1_STATE_FINALIZING,
+	UAC1_STATE_RETIRED,
 } Uac1State;
 
 /* What the descriptor walk found: the one AS interface we know how to drive. */
@@ -89,7 +90,6 @@ typedef struct {
 	uint8_t speed;
 	uint8_t frequency_control;
 	uint16_t max_packet_size;
-	uint16_t packet_bytes;
 	SceUsbdEndpointDescriptor *endpoint;
 } Uac1Stream;
 
@@ -100,6 +100,7 @@ typedef struct {
 	int stream_pipe;
 	int state;
 	int cancelled;
+	int interface_selected;
 	uint32_t generation;
 	Uac1Stream stream;
 } Uac1Session;
@@ -116,6 +117,10 @@ static uint32_t setup_guard;
 static SceKernelSpinlock session_lock;
 static int retired_device_id = -1;
 static int retired_stream_pipe = -1;
+static int retired_control_pipe = -1;
+static uint32_t retired_generation;
+static int deferred_attach = -1;
+static int accepting;
 
 /*
  * An attach USBD offered while a teardown was still in progress.
@@ -126,7 +131,6 @@ static int retired_stream_pipe = -1;
  * gate reopens is what closes that window.  It opens widest coming out of sleep
  * with audio streaming, since that is when teardown takes longest.
  */
-static int deferred_attach = -1;
 static uint8_t rate_buffer[64] __attribute__((aligned(64)));
 
 /*
@@ -141,6 +145,7 @@ static uint8_t rate_buffer[64] __attribute__((aligned(64)));
 
 /* Must exceed one full teardown: see FEEDER_STOP_TIMEOUT_US in stream.c. */
 #define TEARDOWN_JOIN_TIMEOUT_US 6000000u
+#define TEARDOWN_POLL_US 1000u
 
 /* One control transfer on a live device; short because failure is harmless. */
 #define ALT0_DONE_BIT 0x00000001u
@@ -148,7 +153,11 @@ static uint8_t rate_buffer[64] __attribute__((aligned(64)));
 
 static SceUID teardown_event = -1;
 static SceUID teardown_thread = -1;
+static int teardown_started;
+static uint32_t teardown_signal_refs;
 static SceUID alt0_event = -1;
+static uint32_t alt0_generation;
+static uint32_t alt0_callback_refs;
 
 /*
  * Callback tracing. The counters make replug storms readable in the log by
@@ -221,6 +230,49 @@ static int descriptor_before(const void *descriptor, const void *boundary)
 	       (boundary == NULL || (uintptr_t)descriptor < (uintptr_t)boundary);
 }
 
+static const void *first_boundary(const void *a, const void *b)
+{
+	if (a == NULL)
+		return b;
+	if (b == NULL)
+		return a;
+	return (uintptr_t)a < (uintptr_t)b ? a : b;
+}
+
+static int descriptor_fits(const void *descriptor, uint32_t minimum,
+	const void *parent_end)
+{
+	const uint8_t *bytes = descriptor;
+	uintptr_t start;
+	uintptr_t end;
+
+	if (bytes == NULL || !descriptor_before(bytes, parent_end) ||
+	    bytes[0] < minimum)
+		return 0;
+	start = (uintptr_t)bytes;
+	end = start + bytes[0];
+	return end >= start &&
+	       (parent_end == NULL || end <= (uintptr_t)parent_end);
+}
+
+static const void *configuration_end(
+	const SceUsbdConfigurationDescriptor *configuration,
+	const void *next_configuration)
+{
+	uintptr_t start = (uintptr_t)configuration;
+	uintptr_t end;
+
+	if (!descriptor_fits(configuration, USB_CONFIGURATION_DESCRIPTOR_SIZE,
+		next_configuration) ||
+	    configuration->wTotalLength < configuration->bLength)
+		return NULL;
+	end = start + configuration->wTotalLength;
+	if (end < start || (next_configuration != NULL &&
+	    end > (uintptr_t)next_configuration))
+		return NULL;
+	return (const void *)end;
+}
+
 static int open_device_scan(int device_id, DeviceScan *scan)
 {
 	uint32_t guarded_speed = 0xffffffffu;
@@ -245,10 +297,12 @@ static uint16_t endpoint_capacity(uint16_t raw, uint8_t speed)
 	uint16_t payload = raw & 0x07ffu;
 	uint16_t transactions;
 
-	if (payload == 0)
+	if (payload == 0 || (raw & 0xe000u) != 0)
 		return 0;
 	if (speed != SCE_USBD_DEVICE_SPEED_HS)
-		return payload;
+		return payload <= 1023u && (raw & 0x1800u) == 0 ? payload : 0;
+	if (payload > 1024u)
+		return 0;
 
 	/* HS bits 12..11 encode 1-3 transactions; value 3 is reserved. */
 	transactions = (raw >> 11) & 0x03u;
@@ -268,11 +322,12 @@ static uint16_t stream_packet_bytes(uint8_t speed, uint8_t interval)
 	return 0;
 }
 
-static int uac1_header_valid(const uint8_t *header)
+static int uac1_header_valid(const uint8_t *header, const void *parent_end)
 {
 	uint8_t count;
 
-	if (header[0] < 8 || header[2] != UAC_CS_HEADER ||
+	if (!descriptor_fits(header, 8, parent_end) ||
+	    header[2] != UAC_CS_HEADER ||
 	    read_le16(header + 3) != UAC_VERSION_1_0)
 		return 0;
 
@@ -292,13 +347,15 @@ static int header_contains_interface(const uint8_t *header, uint8_t number)
 	return 0;
 }
 
-static int format_supports_target(const uint8_t *format)
+static int format_supports_target(const uint8_t *format,
+	const void *parent_end)
 {
 	uint8_t count;
 	uint8_t index;
 	uint32_t required;
 
-	if (format[0] < 8 || format[2] != UAC_AS_FORMAT_TYPE ||
+	if (!descriptor_fits(format, 8, parent_end) ||
+	    format[2] != UAC_AS_FORMAT_TYPE ||
 	    format[3] != UAC_FORMAT_TYPE_I ||
 	    format[4] != TARGET_CHANNELS ||
 	    format[5] != TARGET_SUBFRAME_BYTES || format[6] != TARGET_BITS)
@@ -326,20 +383,21 @@ static int format_supports_target(const uint8_t *format)
 /* An AS interface must advertise PCM and a format we can actually send. */
 static int interface_supports_target(const DeviceScan *scan,
 	const SceUsbdInterfaceDescriptor *interface,
-	const SceUsbdInterfaceDescriptor *next_if)
+	const void *interface_end)
 {
 	uint8_t *descriptor = next_descriptor(scan, interface,
 		USB_DT_CS_INTERFACE);
 	int pcm = 0;
 	int format = 0;
 
-	for (; descriptor_before(descriptor, next_if);
+	for (; descriptor_before(descriptor, interface_end);
 	     descriptor = next_descriptor(scan, descriptor,
 		USB_DT_CS_INTERFACE)) {
-		if (descriptor[0] >= 7 && descriptor[2] == UAC_AS_GENERAL &&
+		if (descriptor_fits(descriptor, 7, interface_end) &&
+		    descriptor[2] == UAC_AS_GENERAL &&
 		    read_le16(descriptor + 5) == UAC_FORMAT_PCM)
 			pcm = 1;
-		if (format_supports_target(descriptor))
+		if (format_supports_target(descriptor, interface_end))
 			format = 1;
 	}
 
@@ -350,19 +408,20 @@ static int interface_supports_target(const DeviceScan *scan,
 static int endpoint_has_freq_control(const DeviceScan *scan,
 	const SceUsbdEndpointDescriptor *endpoint,
 	const SceUsbdEndpointDescriptor *next_ep,
-	const SceUsbdInterfaceDescriptor *next_if)
+	const void *interface_end)
 {
 	uint8_t *cs = next_descriptor(scan, endpoint, USB_DT_CS_ENDPOINT);
+	const void *endpoint_end = first_boundary(next_ep, interface_end);
 
-	return descriptor_before(cs, next_ep) && descriptor_before(cs, next_if) &&
-	       cs[0] >= 4 && cs[2] == UAC_EP_GENERAL &&
+	return descriptor_fits(cs, 4, endpoint_end) &&
+	       cs[2] == UAC_EP_GENERAL &&
 	       (cs[3] & UAC_EP_FREQ_CONTROL) != 0;
 }
 
 static int build_stream_candidate(const DeviceScan *scan,
 	const SceUsbdConfigurationDescriptor *configuration,
 	const SceUsbdInterfaceDescriptor *interface,
-	const SceUsbdInterfaceDescriptor *next_if,
+	const void *interface_end,
 	SceUsbdEndpointDescriptor *endpoint,
 	Uac1Stream *found)
 {
@@ -371,7 +430,9 @@ static int build_stream_candidate(const DeviceScan *scan,
 	uint16_t capacity;
 	uint16_t packet_bytes;
 
-	if ((endpoint->bEndpointAddress & SCE_USBD_ENDPOINT_DIRECTION_BITS) !=
+	if ((endpoint->bEndpointAddress & 0x0fu) == 0 ||
+	    (endpoint->bEndpointAddress & 0x70u) != 0 ||
+	    (endpoint->bEndpointAddress & SCE_USBD_ENDPOINT_DIRECTION_BITS) !=
 		SCE_USBD_ENDPOINT_DIRECTION_OUT ||
 	    (endpoint->bmAttributes & SCE_USBD_ENDPOINT_TRANSFER_TYPE_BITS) !=
 		SCE_USBD_ENDPOINT_TRANSFER_TYPE_ISOCHRONOUS)
@@ -413,9 +474,8 @@ static int build_stream_candidate(const DeviceScan *scan,
 	found->interval = endpoint->bInterval;
 	found->speed = scan->speed;
 	found->frequency_control = (uint8_t)endpoint_has_freq_control(
-		scan, endpoint, next_ep, next_if);
+		scan, endpoint, next_ep, interface_end);
 	found->max_packet_size = capacity;
-	found->packet_bytes = packet_bytes;
 	found->endpoint = endpoint;
 	return 1;
 }
@@ -423,7 +483,7 @@ static int build_stream_candidate(const DeviceScan *scan,
 /* Search the AS interfaces this control header claims in its baInterfaceNr[]. */
 static int find_stream_for_function(const DeviceScan *scan,
 	const SceUsbdConfigurationDescriptor *configuration,
-	const SceUsbdConfigurationDescriptor *config_end,
+	const void *config_end,
 	const uint8_t *control_header,
 	Uac1Stream *found)
 {
@@ -433,26 +493,29 @@ static int find_stream_for_function(const DeviceScan *scan,
 	while ((interface = next_interface(scan, cursor)) != NULL &&
 	       descriptor_before(interface, config_end)) {
 		SceUsbdInterfaceDescriptor *next_if = next_interface(scan, interface);
+		const void *interface_end = first_boundary(next_if, config_end);
 		SceUsbdEndpointDescriptor *endpoint;
 
 		cursor = interface;
-		if (interface->bLength < USB_INTERFACE_DESCRIPTOR_SIZE ||
+		if (!descriptor_fits(interface, USB_INTERFACE_DESCRIPTOR_SIZE,
+			config_end) ||
 		    !header_contains_interface(control_header,
 			interface->bInterfaceNumber) ||
 		    interface->bInterfaceClass != SCE_USBD_CLASS_AUDIO ||
 		    interface->bInterfaceSubclass != UAC_SUBCLASS_STREAMING ||
 		    interface->bAlternateSetting == 0 ||
 		    interface->bNumEndpoints == 0 ||
-		    !interface_supports_target(scan, interface, next_if))
+		    !interface_supports_target(scan, interface, interface_end))
 			continue;
 
 		endpoint = next_endpoint(scan, interface);
-		while (descriptor_before(endpoint, next_if)) {
+		while (descriptor_before(endpoint, interface_end)) {
 			SceUsbdEndpointDescriptor *next_ep = next_endpoint(scan, endpoint);
 
-			if (endpoint->bLength >= USB_ENDPOINT_DESCRIPTOR_SIZE &&
+			if (descriptor_fits(endpoint, USB_ENDPOINT_DESCRIPTOR_SIZE,
+				interface_end) &&
 			    build_stream_candidate(scan, configuration, interface,
-				next_if, endpoint, found))
+				interface_end, endpoint, found))
 				return 1;
 			endpoint = next_ep;
 		}
@@ -476,32 +539,37 @@ static int find_target_stream(int device_id, Uac1Stream *found)
 	}
 
 	while ((configuration = next_config(&scan, config_cursor)) != NULL) {
-		SceUsbdConfigurationDescriptor *config_end =
+		SceUsbdConfigurationDescriptor *next_configuration =
 			next_config(&scan, configuration);
+		const void *config_end = configuration_end(configuration,
+			next_configuration);
 		SceUsbdInterfaceDescriptor *interface;
 		const void *if_cursor = configuration;
 
 		config_cursor = configuration;
-		if (configuration->bLength < USB_CONFIGURATION_DESCRIPTOR_SIZE)
+		if (config_end == NULL)
 			continue;
 		while ((interface = next_interface(&scan, if_cursor)) != NULL &&
 		       descriptor_before(interface, config_end)) {
 			SceUsbdInterfaceDescriptor *next_if =
 				next_interface(&scan, interface);
+			const void *interface_end = first_boundary(next_if,
+				config_end);
 			uint8_t *descriptor;
 
 			if_cursor = interface;
-			if (interface->bLength < USB_INTERFACE_DESCRIPTOR_SIZE ||
+			if (!descriptor_fits(interface,
+				USB_INTERFACE_DESCRIPTOR_SIZE, config_end) ||
 			    interface->bInterfaceClass != SCE_USBD_CLASS_AUDIO ||
 			    interface->bInterfaceSubclass != UAC_SUBCLASS_CONTROL)
 				continue;
 
 			for (descriptor = next_descriptor(&scan, interface,
 				USB_DT_CS_INTERFACE);
-			     descriptor_before(descriptor, next_if);
+			     descriptor_before(descriptor, interface_end);
 			     descriptor = next_descriptor(&scan, descriptor,
 				USB_DT_CS_INTERFACE)) {
-				if (uac1_header_valid(descriptor) &&
+				if (uac1_header_valid(descriptor, interface_end) &&
 				    find_stream_for_function(&scan, configuration,
 					config_end, descriptor, found))
 					return 1;
@@ -512,16 +580,14 @@ static int find_target_stream(int device_id, Uac1Stream *found)
 	return 0;
 }
 
-static uint32_t next_generation(void)
+/* session_lock serializes generation allocation and prevents ABA at claim. */
+static uint32_t next_generation_locked(void)
 {
-	uint32_t generation;
-
 	/* Zero is reserved so NULL is never a valid callback token. */
 	do {
-		generation = __atomic_add_fetch(
-			&generation_counter, 1, __ATOMIC_RELAXED);
-	} while (generation == 0);
-	return generation;
+		++generation_counter;
+	} while (generation_counter == 0);
+	return generation_counter;
 }
 
 static void *generation_arg(uint32_t generation)
@@ -552,7 +618,9 @@ static int transition_state(
 }
 
 static void try_finalize_cleanup(void);
-static int request_cleanup(uint32_t generation, const char *reason);
+static void try_finish_retirement(void);
+static void retry_deferred_attach(int device);
+static void request_cleanup(uint32_t generation, const char *reason);
 static void interface_done(int32_t result, int32_t count, void *arg);
 
 /*
@@ -576,8 +644,10 @@ static int teardown_worker(SceSize args, void *argp)
 			TEARDOWN_WORK_BIT | TEARDOWN_EXIT_BIT,
 			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &matched, NULL) < 0)
 			return -1;
-		if (matched & TEARDOWN_WORK_BIT)
+		if (matched & TEARDOWN_WORK_BIT) {
 			try_finalize_cleanup();
+			try_finish_retirement();
+		}
 		if (matched & TEARDOWN_EXIT_BIT)
 			return 0;
 	}
@@ -599,8 +669,16 @@ int uac1_lifecycle_init(void)
 			goto fail;
 		alt0_event = result;
 	}
-	if (teardown_thread >= 0)
-		return 0;
+	if (teardown_thread >= 0) {
+		if (teardown_started) {
+			uac1_lifecycle_accept();
+			return 0;
+		}
+		result = ksceKernelDeleteThread(teardown_thread);
+		if (result < 0)
+			return result;
+		teardown_thread = -1;
+	}
 	result = ksceKernelCreateThread("uac_teardown", teardown_worker, 0x40,
 		0x2000, 0, 0, NULL);
 	if (result < 0)
@@ -608,10 +686,14 @@ int uac1_lifecycle_init(void)
 	teardown_thread = result;
 	result = ksceKernelStartThread(teardown_thread, 0, NULL);
 	if (result < 0) {
-		(void)ksceKernelDeleteThread(teardown_thread);
-		teardown_thread = -1;
+		if (ksceKernelDeleteThread(teardown_thread) >= 0)
+			teardown_thread = -1;
+		else
+			return result;
 		goto fail;
 	}
+	teardown_started = 1;
+	uac1_lifecycle_accept();
 	return 0;
 
 fail:
@@ -622,23 +704,94 @@ fail:
 	return result;
 }
 
+void uac1_lifecycle_quiesce(void)
+{
+	SceKernelIntrStatus lock_state =
+		ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+	uint32_t generation;
+
+	accepting = 0;
+	generation = __atomic_load_n(&active.generation, __ATOMIC_ACQUIRE);
+	if (__atomic_load_n(&active.device_id, __ATOMIC_ACQUIRE) >= 0)
+		deferred_attach = __atomic_load_n(
+			&active.device_id, __ATOMIC_RELAXED);
+	ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+	if (generation != 0)
+		request_cleanup(generation, "lifecycle quiesce");
+}
+
+void uac1_lifecycle_accept(void)
+{
+	SceKernelIntrStatus lock_state =
+		ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+	int retry = -1;
+
+	accepting = 1;
+	if (__atomic_load_n(&setup_guard, __ATOMIC_ACQUIRE) == 0 &&
+	    __atomic_load_n(&active.state, __ATOMIC_ACQUIRE) == UAC1_STATE_IDLE) {
+		retry = deferred_attach;
+		deferred_attach = -1;
+	}
+	ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+	retry_deferred_attach(retry);
+}
+
 /* Call only after the USB driver is unregistered, so no callback can requeue. */
 int uac1_lifecycle_shutdown(void)
 {
+	SceKernelIntrStatus lock_state;
 	SceUInt timeout = TEARDOWN_JOIN_TIMEOUT_US;
+	uint32_t polls = TEARDOWN_JOIN_TIMEOUT_US / TEARDOWN_POLL_US;
 	int status;
 	int result;
+	int ready;
 
-	/* Finish any session the last detach left pending, on this thread. */
-	try_finalize_cleanup();
+	for (;;) {
+		/* Either this caller or the worker wins FINALIZING; never both. */
+		try_finalize_cleanup();
+		try_finish_retirement();
+
+		lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+		if (!accepting &&
+		    __atomic_load_n(&setup_guard, __ATOMIC_ACQUIRE) == 0 &&
+		    __atomic_load_n(&active.state, __ATOMIC_ACQUIRE) == UAC1_STATE_IDLE)
+			deferred_attach = -1;
+		ready = !accepting && deferred_attach < 0 &&
+			__atomic_load_n(&setup_guard, __ATOMIC_ACQUIRE) == 0 &&
+			__atomic_load_n(&active.state, __ATOMIC_ACQUIRE) ==
+				UAC1_STATE_IDLE &&
+			__atomic_load_n(&active.generation, __ATOMIC_ACQUIRE) == 0 &&
+			__atomic_load_n(&active.device_id, __ATOMIC_ACQUIRE) < 0 &&
+			__atomic_load_n(&active.control_pipe, __ATOMIC_ACQUIRE) < 0 &&
+			__atomic_load_n(&active.stream_pipe, __ATOMIC_ACQUIRE) < 0 &&
+			retired_stream_pipe < 0 && retired_control_pipe < 0 &&
+			__atomic_load_n(&alt0_generation, __ATOMIC_ACQUIRE) == 0 &&
+			__atomic_load_n(&alt0_callback_refs, __ATOMIC_ACQUIRE) == 0 &&
+			__atomic_load_n(&teardown_signal_refs, __ATOMIC_ACQUIRE) == 0;
+		if (ready) {
+			retired_device_id = -1;
+			retired_generation = 0;
+		}
+		ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+		if (ready)
+			break;
+		if (polls-- == 0)
+			return -1;
+		signal_teardown();
+		ksceKernelDelayThread(TEARDOWN_POLL_US);
+	}
 
 	if (teardown_thread >= 0) {
-		if (teardown_event >= 0)
-			(void)ksceKernelSetEventFlag(teardown_event,
-				TEARDOWN_EXIT_BIT);
-		result = ksceKernelWaitThreadEnd(teardown_thread, &status, &timeout);
-		if (result < 0)
-			return result;
+		if (teardown_started) {
+			if (teardown_event >= 0)
+				(void)ksceKernelSetEventFlag(teardown_event,
+					TEARDOWN_EXIT_BIT);
+			result = ksceKernelWaitThreadEnd(
+				teardown_thread, &status, &timeout);
+			if (result < 0)
+				return result;
+			teardown_started = 0;
+		}
 		result = ksceKernelDeleteThread(teardown_thread);
 		if (result < 0)
 			return result;
@@ -675,20 +828,46 @@ static int setup_enter(void)
 
 static void setup_leave(void)
 {
-	uint32_t old = __atomic_fetch_sub(&setup_guard, 1u, __ATOMIC_ACQ_REL);
+	uint32_t old;
+	int last;
 
-	if (old == SETUP_CLOSING + 1u)
+	for (;;) {
+		old = __atomic_load_n(&setup_guard, __ATOMIC_ACQUIRE);
+		last = old == SETUP_CLOSING + 1u;
+		if (last)
+			__atomic_add_fetch(&teardown_signal_refs, 1,
+				__ATOMIC_ACQ_REL);
+		if (__atomic_compare_exchange_n(&setup_guard, &old, old - 1u, 0,
+			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			break;
+		if (last)
+			__atomic_sub_fetch(&teardown_signal_refs, 1,
+				__ATOMIC_RELEASE);
+	}
+	if (last) {
 		signal_teardown();
+		__atomic_sub_fetch(&teardown_signal_refs, 1, __ATOMIC_RELEASE);
+	}
 }
 
 static void alt0_done(int32_t result, int32_t count, void *arg)
 {
+	uint32_t generation = arg_generation(arg);
+	uint32_t expected = generation;
+
 	(void)count;
-	(void)arg;
 	(void)result; /* uac_log may compile out. */
-	uac_log(LOG_PREFIX "select alt 0: 0x%08x\n", result);
-	if (alt0_event >= 0)
-		(void)ksceKernelSetEventFlag(alt0_event, ALT0_DONE_BIT);
+	__atomic_add_fetch(&alt0_callback_refs, 1, __ATOMIC_ACQUIRE);
+	if (__atomic_compare_exchange_n(&alt0_generation, &expected, 0u, 0,
+		__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		uac_log(LOG_PREFIX "select alt 0: 0x%08x\n", result);
+		if (alt0_event >= 0)
+			(void)ksceKernelSetEventFlag(alt0_event, ALT0_DONE_BIT);
+	}
+	__atomic_add_fetch(&teardown_signal_refs, 1, __ATOMIC_ACQ_REL);
+	__atomic_sub_fetch(&alt0_callback_refs, 1, __ATOMIC_RELEASE);
+	signal_teardown();
+	__atomic_sub_fetch(&teardown_signal_refs, 1, __ATOMIC_RELEASE);
 }
 
 /*
@@ -699,37 +878,74 @@ static void alt0_done(int32_t result, int32_t count, void *arg)
  * as the clock source never falling back to internal.  Pointless once the
  * device is physically gone, so the caller gates on that.
  */
-static void release_streaming_interface(int control_pipe)
+static void release_streaming_interface(int control_pipe, uint32_t generation,
+	uint8_t interface_number)
 {
 	SceUInt timeout = ALT0_TIMEOUT_US;
 	uint32_t matched;
+	uint32_t expected;
 	int submit;
 
-	if (control_pipe < 0 || alt0_event < 0 || active.stream.alternate_setting == 0)
+	if (control_pipe < 0 || alt0_event < 0)
 		return;
 	(void)ksceKernelClearEventFlag(alt0_event, 0);
-	submit = ksceUsbdSetInterface(control_pipe, active.stream.interface_number, 0,
-		alt0_done, NULL);
+	__atomic_store_n(&alt0_generation, generation, __ATOMIC_RELEASE);
+	submit = ksceUsbdSetInterface(control_pipe, interface_number, 0,
+		alt0_done, generation_arg(generation));
 	uac_log(LOG_PREFIX "select alt 0 submit: 0x%08x\n", submit);
-	if (submit < 0)
+	if (submit < 0) {
+		expected = generation;
+		(void)__atomic_compare_exchange_n(&alt0_generation, &expected, 0u,
+			0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 		return;
+	}
 	(void)ksceKernelWaitEventFlag(alt0_event, ALT0_DONE_BIT,
 		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &matched, &timeout);
 }
 
-/*
- * Runs on the teardown worker, never on a USBD callback, so re-running setup
- * here is safe.  If the device really went away while we were asleep the pipe
- * opens fail and request_cleanup() unwinds normally -- no worse than now.
- */
-static void retry_deferred_attach(void)
+/* session_lock held. Opening the gate is always coupled to taking its waiter. */
+static int reopen_setup_locked(void)
 {
-	int device = __atomic_exchange_n(&deferred_attach, -1, __ATOMIC_ACQ_REL);
+	int device = accepting ? deferred_attach : -1;
 
+	if (accepting)
+		deferred_attach = -1;
+	__atomic_store_n(&setup_guard, 0, __ATOMIC_RELEASE);
+	return device;
+}
+
+static void retry_deferred_attach(int device)
+{
 	if (device >= 0) {
 		uac_log(LOG_PREFIX "retrying deferred attach: device %d\n", device);
 		(void)uac1_attach(device);
 	}
+}
+
+/* session_lock held; a closed pipe or physical detach proves no late submit. */
+static void retire_alt0_locked(uint32_t generation)
+{
+	(void)__atomic_compare_exchange_n(&alt0_generation, &generation, 0u, 0,
+		__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static void try_finish_retirement(void)
+{
+	SceKernelIntrStatus lock_state;
+	int retry = -1;
+
+	lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+	if (__atomic_load_n(&active.state, __ATOMIC_ACQUIRE) ==
+		UAC1_STATE_RETIRED &&
+	    retired_stream_pipe < 0 && retired_control_pipe < 0 &&
+	    __atomic_load_n(&alt0_generation, __ATOMIC_ACQUIRE) == 0 &&
+	    __atomic_load_n(&alt0_callback_refs, __ATOMIC_ACQUIRE) == 0) {
+		retired_generation = 0;
+		__atomic_store_n(&active.state, UAC1_STATE_IDLE, __ATOMIC_RELEASE);
+		retry = reopen_setup_locked();
+	}
+	ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+	retry_deferred_attach(retry);
 }
 
 static void try_finalize_cleanup(void)
@@ -739,10 +955,15 @@ static void try_finalize_cleanup(void)
 	int stream_pipe;
 	int control_pipe;
 	int device_id;
-	int pending_pipe = -1;
-	int retire_pipe = -1;
+	int pending_stream = -1;
+	int pending_control = -1;
+	int retire_stream = -1;
+	int stream_close = 0;
+	int control_close = 0;
 	int was_detached;
-	int wait_for_detach;
+	int interface_selected;
+	uint8_t interface_number;
+	uint32_t generation;
 
 	if (__atomic_load_n(&setup_guard, __ATOMIC_ACQUIRE) != SETUP_CLOSING)
 		return;
@@ -755,92 +976,86 @@ static void try_finalize_cleanup(void)
 		&active.stream_pipe, -1, __ATOMIC_ACQ_REL);
 	control_pipe = __atomic_exchange_n(
 		&active.control_pipe, -1, __ATOMIC_ACQ_REL);
+	generation = __atomic_load_n(&active.generation, __ATOMIC_ACQUIRE);
+	interface_selected = __atomic_load_n(&active.interface_selected,
+		__ATOMIC_ACQUIRE);
+	interface_number = active.stream.interface_number;
 	if (stream_pipe >= 0) {
-		int close_result = ksceUsbdClosePipe(stream_pipe);
-
-		uac_log(LOG_PREFIX "stream pipe close: 0x%08x\n", close_result);
-		was_detached = __atomic_load_n(&active.cancelled, __ATOMIC_ACQUIRE);
-		if (close_result >= 0 || was_detached)
-			uac_stream_pipe_closed(stream_pipe);
-		else
-			pending_pipe = stream_pipe;
+		stream_close = ksceUsbdClosePipe(stream_pipe);
+		uac_log(LOG_PREFIX "stream pipe close: 0x%08x\n", stream_close);
 	}
 	/* Only worth telling a device that is still there. */
-	if (!__atomic_load_n(&active.cancelled, __ATOMIC_ACQUIRE))
-		release_streaming_interface(control_pipe);
-	if (control_pipe >= 0)
-		ksceUsbdClosePipe(control_pipe);
+	if (interface_selected &&
+	    !__atomic_load_n(&active.cancelled, __ATOMIC_ACQUIRE))
+		release_streaming_interface(control_pipe, generation, interface_number);
+	if (control_pipe >= 0) {
+		control_close = ksceUsbdClosePipe(control_pipe);
+		uac_log(LOG_PREFIX "control pipe close: 0x%08x\n", control_close);
+	}
 
 	lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
 	device_id = __atomic_load_n(&active.device_id, __ATOMIC_ACQUIRE);
+	was_detached = __atomic_load_n(&active.cancelled, __ATOMIC_ACQUIRE);
+	if (stream_pipe >= 0) {
+		if (stream_close >= 0 || was_detached)
+			retire_stream = stream_pipe;
+		else
+			pending_stream = stream_pipe;
+	}
+	if (control_pipe >= 0 && control_close < 0 && !was_detached)
+		pending_control = control_pipe;
+	if ((control_pipe >= 0 && (control_close >= 0 || was_detached)) ||
+	    was_detached)
+		retire_alt0_locked(generation);
 
-	/*
-	 * Keep SETUP_CLOSING set until every field is ready for the next attach.
-	 * Publish the retired ID and any unclosed stream pipe before releasing
-	 * device ownership. A late detach then proves the pipe is gone and can
-	 * finish stream retirement before the setup gate reopens.
-	 */
-	__atomic_store_n(&retired_device_id, device_id, __ATOMIC_RELEASE);
-	__atomic_store_n(&retired_stream_pipe, pending_pipe, __ATOMIC_RELEASE);
+	retired_device_id = device_id;
+	retired_stream_pipe = pending_stream;
+	retired_control_pipe = pending_control;
+	retired_generation = generation;
 	__atomic_store_n(&active.generation, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&active.device_id, -1, __ATOMIC_RELEASE);
-	was_detached = __atomic_load_n(&active.cancelled, __ATOMIC_ACQUIRE);
-	if (was_detached) {
-		int expected_device = device_id;
-
-		(void)__atomic_compare_exchange_n(&retired_device_id,
-			&expected_device, -1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-		retire_pipe = __atomic_exchange_n(
-			&retired_stream_pipe, -1, __ATOMIC_ACQ_REL);
-	}
-	wait_for_detach = __atomic_load_n(
-		&retired_stream_pipe, __ATOMIC_ACQUIRE) >= 0;
+	__atomic_store_n(&active.interface_selected, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&active.cancelled, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&active.state, UAC1_STATE_RETIRED, __ATOMIC_RELEASE);
 	ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
 
-	if (retire_pipe >= 0)
-		uac_stream_pipe_closed(retire_pipe);
-	if (!wait_for_detach) {
-		__atomic_store_n(&active.state, UAC1_STATE_IDLE, __ATOMIC_RELEASE);
-		/* Opening the guard is the final publication step. */
-		__atomic_store_n(&setup_guard, 0, __ATOMIC_RELEASE);
-		retry_deferred_attach();
-	}
+	if (retire_stream >= 0)
+		uac_stream_pipe_closed(retire_stream);
+	try_finish_retirement();
 }
 
-static int request_cleanup(uint32_t generation, const char *reason)
+static void request_cleanup(uint32_t generation, const char *reason)
 {
+	SceKernelIntrStatus lock_state;
 	int state;
-	int expected;
 	uint32_t old_guard;
+	int changed = 0;
 
 	(void)reason; /* uac_log may compile out. */
-	if (__atomic_load_n(&active.generation, __ATOMIC_ACQUIRE) != generation)
-		return 0;
-
-	for (;;) {
-		state = __atomic_load_n(&active.state, __ATOMIC_ACQUIRE);
-		if (state == UAC1_STATE_IDLE || state == UAC1_STATE_FINALIZING)
-			return 0;
-		if (state == UAC1_STATE_CLEANING)
-			break;
-
-		expected = state;
-		if (__atomic_compare_exchange_n(&active.state, &expected,
-			UAC1_STATE_CLEANING, 0, __ATOMIC_ACQ_REL,
-			__ATOMIC_ACQUIRE)) {
-			uac_log(LOG_PREFIX "cleanup generation %u: %s\n", generation,
-				reason != NULL ? reason : "unspecified");
-			break;
-		}
+	lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+	if (__atomic_load_n(&active.generation, __ATOMIC_ACQUIRE) != generation) {
+		ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+		return;
 	}
-
-	/* Once closing is set, late callbacks cannot acquire a setup reference. */
+	state = __atomic_load_n(&active.state, __ATOMIC_ACQUIRE);
+	if (state == UAC1_STATE_IDLE || state == UAC1_STATE_FINALIZING ||
+	    state == UAC1_STATE_RETIRED) {
+		ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+		return;
+	}
 	old_guard = __atomic_fetch_or(&setup_guard, SETUP_CLOSING,
 		__ATOMIC_ACQ_REL);
+	if (state != UAC1_STATE_CLEANING) {
+		__atomic_store_n(&active.state, UAC1_STATE_CLEANING,
+			__ATOMIC_RELEASE);
+		changed = 1;
+	}
+	ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+	if (changed)
+		uac_log(LOG_PREFIX "cleanup generation %u: %s\n", generation,
+			reason != NULL ? reason : "unspecified");
 	if ((old_guard & SETUP_REFS) == 0)
 		signal_teardown();
-	return 1;
 }
 
 /*
@@ -862,13 +1077,25 @@ void uac1_suspend_session(void)
 	uint32_t generation = __atomic_load_n(&active.generation, __ATOMIC_ACQUIRE);
 
 	if (generation != 0)
-		(void)request_cleanup(generation, "system suspend");
+		request_cleanup(generation, "system suspend");
 }
 
 /* Re-drive a teardown that suspend interrupted. No-ops when nothing pends. */
 void uac1_resume_retry(void)
 {
 	signal_teardown();
+}
+
+void uac1_stream_failed(void)
+{
+	uint32_t generation;
+
+	if (__atomic_load_n(&active.state, __ATOMIC_ACQUIRE) !=
+		UAC1_STATE_STREAMING)
+		return;
+	generation = __atomic_load_n(&active.generation, __ATOMIC_ACQUIRE);
+	if (generation != 0)
+		request_cleanup(generation, "stream failed");
 }
 
 static void start_stream(uint32_t generation, Uac1State old_state)
@@ -890,14 +1117,13 @@ static void rate_done(int32_t result, int32_t count, void *arg)
 {
 	uint32_t generation = arg_generation(arg);
 
-	(void)count;
 	if (!setup_enter())
 		return;
 	if (!active_in_state(generation, UAC1_STATE_SET_RATE))
 		goto out;
 
 	uac_log(LOG_PREFIX "set fixed 48 kHz: 0x%08x\n", result);
-	if (result < 0)
+	if (result < 0 || count != 3)
 		request_cleanup(generation, "48 kHz SET_CUR failed");
 	else
 		start_stream(generation, UAC1_STATE_SET_RATE);
@@ -924,6 +1150,7 @@ static void interface_done(int32_t result, int32_t count, void *arg)
 		request_cleanup(generation, "SET_INTERFACE failed");
 		goto out;
 	}
+	__atomic_store_n(&active.interface_selected, 1, __ATOMIC_RELEASE);
 	if (!active.stream.frequency_control) {
 		start_stream(generation, UAC1_STATE_SET_INTERFACE);
 		goto out;
@@ -1015,8 +1242,40 @@ int uac1_probe(int device_id)
 		device->idVendor, device->idProduct, found.speed,
 		found.interface_number, found.alternate_setting,
 		found.endpoint_address, found.interval, found.max_packet_size,
-		found.packet_bytes, found.frequency_control);
+		TARGET_PACKET_BYTES, found.frequency_control);
 	return SCE_USBD_PROBE_SUCCEEDED;
+}
+
+static int attach_setup_enter(int device_id)
+{
+	SceKernelIntrStatus lock_state;
+	uint32_t guard;
+
+	for (;;) {
+		if (setup_enter())
+			return 1;
+		lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+		guard = __atomic_load_n(&setup_guard, __ATOMIC_ACQUIRE);
+		if (!accepting) {
+			ksceKernelSpinlockLowUnlockCpuResumeIntr(
+				&session_lock, lock_state);
+			return 0;
+		}
+		if (guard & SETUP_CLOSING) {
+			if (deferred_attach < 0 || deferred_attach == device_id)
+				deferred_attach = device_id;
+			ksceKernelSpinlockLowUnlockCpuResumeIntr(
+				&session_lock, lock_state);
+			uac_log(LOG_PREFIX
+				"attach deferred: device %d, teardown in progress\n",
+				device_id);
+			return 0;
+		}
+		ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+		if ((guard & SETUP_REFS) == SETUP_REFS)
+			return 0;
+		/* The finalizer reopened the gate before we acquired session_lock. */
+	}
 }
 
 int uac1_attach(int device_id)
@@ -1031,28 +1290,32 @@ int uac1_attach(int device_id)
 
 	TRACE_CALLBACK(attach_count, "attach callback #%u: device %d\n", device_id);
 
-	if (!setup_enter()) {
-		/* Remember it; try_finalize_cleanup() retries once the gate reopens. */
-		__atomic_store_n(&deferred_attach, device_id, __ATOMIC_RELEASE);
-		uac_log(LOG_PREFIX "attach deferred: device %d, teardown in progress\n",
-			device_id);
+	if (!attach_setup_enter(device_id))
 		return SCE_USBD_ATTACH_FAILED;
-	}
 
 	lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+	if (!accepting) {
+		ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
+		goto out;
+	}
 	if (__atomic_load_n(&active.device_id, __ATOMIC_RELAXED) != -1) {
 		uac_log(LOG_PREFIX "attach rejected: device %d already active\n",
 			__atomic_load_n(&active.device_id, __ATOMIC_RELAXED));
 		ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
 		goto out;
 	}
+	if (deferred_attach == device_id)
+		deferred_attach = -1;
+	retired_device_id = -1;
+	retired_generation = 0;
 	__atomic_store_n(&active.device_id, device_id, __ATOMIC_RELAXED);
-	generation = next_generation();
+	generation = next_generation_locked();
 	__atomic_store_n(&active.generation, generation, __ATOMIC_RELEASE);
 	__atomic_store_n(&active.state, UAC1_STATE_CLAIMED, __ATOMIC_RELEASE);
 	__atomic_store_n(&active.control_pipe, -1, __ATOMIC_RELEASE);
 	__atomic_store_n(&active.stream_pipe, -1, __ATOMIC_RELEASE);
 	__atomic_store_n(&active.cancelled, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&active.interface_selected, 0, __ATOMIC_RELEASE);
 	ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
 
 	/* Probe and attach are separate callbacks, so rediscover the stream. */
@@ -1110,44 +1373,44 @@ int uac1_detach(int device_id)
 {
 	SceKernelIntrStatus lock_state;
 	uint32_t generation;
-	int retired_pipe;
-	int result;
+	int retired_pipe = -1;
+	int was_deferred = 0;
 
 	TRACE_CALLBACK(detach_count, "detach callback #%u: device %d, active %d\n",
 		device_id, __atomic_load_n(&active.device_id, __ATOMIC_ACQUIRE));
 
 	lock_state = ksceKernelSpinlockLowLockCpuSuspendIntr(&session_lock);
+	if (deferred_attach == device_id) {
+		deferred_attach = -1;
+		was_deferred = 1;
+	}
 	if (device_id != __atomic_load_n(&active.device_id, __ATOMIC_RELAXED)) {
-		if (device_id == __atomic_load_n(&retired_device_id,
-			__ATOMIC_RELAXED)) {
-			__atomic_store_n(&retired_device_id, -1, __ATOMIC_RELAXED);
-			retired_pipe = __atomic_exchange_n(
-				&retired_stream_pipe, -1, __ATOMIC_RELAXED);
+		if (device_id == retired_device_id) {
+			retired_device_id = -1;
+			retired_pipe = retired_stream_pipe;
+			retired_stream_pipe = -1;
+			retired_control_pipe = -1;
+			retire_alt0_locked(retired_generation);
 			ksceKernelSpinlockLowUnlockCpuResumeIntr(
 				&session_lock, lock_state);
-			if (retired_pipe >= 0) {
+			if (retired_pipe >= 0)
 				uac_stream_pipe_closed(retired_pipe);
-				__atomic_store_n(&active.state, UAC1_STATE_IDLE,
-					__ATOMIC_RELEASE);
-				__atomic_store_n(&setup_guard, 0, __ATOMIC_RELEASE);
-			}
+			signal_teardown();
 			uac_log(LOG_PREFIX "accepted late detach for device %d\n",
 				device_id);
 			return SCE_USBD_DETACH_SUCCEEDED;
 		}
 		ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
-		return SCE_USBD_DETACH_FAILED;
+		return was_deferred ? SCE_USBD_DETACH_SUCCEEDED :
+			SCE_USBD_DETACH_FAILED;
 	}
 
 	__atomic_store_n(&active.cancelled, 1, __ATOMIC_RELEASE);
 	generation = __atomic_load_n(&active.generation, __ATOMIC_ACQUIRE);
 	ksceKernelSpinlockLowUnlockCpuResumeIntr(&session_lock, lock_state);
 	if (generation != 0)
-		result = request_cleanup(generation, "device detached");
-	else
-		result = 0;
+		request_cleanup(generation, "device detached");
 
 	uac_log(LOG_PREFIX "detached\n");
-	(void)result;
 	return SCE_USBD_DETACH_SUCCEEDED;
 }

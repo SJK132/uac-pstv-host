@@ -18,24 +18,24 @@ It is **output only**. Microphones and headset input are not supported.
 Kernel plugins deserve suspicion, so here is exactly what this one does, and
 when.
 
-**With no USB audio device attached, it does nothing at all.** It registers a
-USB driver and waits. `SceAVConfig` is never read, no hooks are installed, and
-no Sony code is touched. Attach a device that isn't UAC1 and that stays true —
-it's declined during probe and nothing further happens.
+**With no USB audio device attached, it does no audio-routing work.** It keeps
+only its USB driver, lifecycle thread and system-event handler registered.
+`SceAVConfig` is never read and no hooks are installed. Attach a device that
+isn't UAC1 and it is declined during probe without touching Sony audio state.
 
 The two taiHEN hooks go in **only after** a UAC1 device has been probed,
 claimed, configured, had its streaming interface selected and its sample rate
-accepted. They come back out when the stream stops.
+accepted. They come back out after teardown completes successfully; a failed
+teardown keeps them installed so the resident module can retry safely.
 
 **Nothing persists.** The release build writes nothing to storage — no registry
 keys, no flash, no files. Everything it does lives in RAM: two hooks, and writes
 to AVConfig's data segment. A reboot is a complete reset, so there is no state
 that can be left in a bad shape.
 
-**`module_start` cannot fault.** It calls only SDK functions and dereferences no
-computed address, so a wrong offset or an unexpected firmware cannot stop the
-console booting. The code that derives addresses runs only once you attach an
-audio device — which is entirely under your control.
+**`module_start` does not resolve or dereference private Sony addresses.** A
+wrong profile cannot affect boot: resolution and hook installation happen only
+after a supported UAC1 device has configured successfully.
 
 If something does go wrong, remove the line from `config.txt` and reboot.
 
@@ -94,8 +94,11 @@ build (below) and look for a `reject ep` line — it names the exact reason.
 
 ## Supported firmware
 
-3.60, 3.61, 3.63, 3.65, 3.67, 3.68, 3.71 and 3.73. PlayStation TV only — the
-plugin checks and unloads itself on a handheld Vita.
+Verified profiles are 3.60, 3.61, 3.63, 3.65, 3.67, 3.68, 3.71 and 3.73.
+PlayStation TV only; the plugin checks and unloads itself on a handheld Vita.
+Unverified firmware (currently 3.69, 3.70, 3.72 and 3.74) is rejected at USB
+attach without installing a hook. Each needs a real `SceAVConfig` module sample
+before it can be added safely.
 
 ## How it works
 
@@ -105,29 +108,31 @@ so the plugin borrows Sony's own path for it.
 `SceAVConfig` already knows how to render system audio into a RAM buffer instead
 of sending it to HDMI — that's the route it uses to feed Bluetooth audio. The
 plugin claims that route for itself, then runs a worker that hands Sony's
-`SceAudio` RAM-output function a pair of 480-frame buffers in ping-pong, exactly
-the way Sony's own Bluetooth worker does. Captured PCM lands in a two-slot
-seqlock staging buffer.
+`SceAudio` RAM-output function a pair of 240-frame buffers in ping-pong. Captured
+PCM lands in a four-slot seqlock staging buffer. The smaller page was validated
+on hardware; the Sony RAM-output contract itself is otherwise unchanged.
 
 On the USB side, a UAC1 driver enumerates the device, walks its descriptors to
 find a stream interface it can actually drive, selects the alternate setting and
-sets the sample rate. A feeder thread slices the staged 480-frame blocks into
-48-frame (192-byte) packets and pumps them through two isochronous request
-contexts — one in flight, one being prepared, rotated by the completion
-callback. That shallow two-context shape mirrors Sony's own USB audio transport
-rather than a deep queue.
+sets the sample rate. A feeder thread slices the staged 240-frame blocks into
+48-frame (192-byte) packets and rotates four fixed isochronous contexts: three
+owned by USBD and one READY or being prepared. The completion callback submits
+the oldest READY context before waking the feeder, keeping the periodic USB
+schedule ahead without building a deep audio queue.
 
 Two taiHEN hooks make Sony cooperate while USB owns the route: one redirects the
 DataSend start into the plugin's capture worker, and one absorbs the
-physical-stop wrapper locally so tearing down the USB stream doesn't stop the
-audio hardware. Real Bluetooth passes through untouched, and both hooks are
-removed when the stream stops.
+physical-stop wrapper locally so tearing down the USB stream doesn't wait on a
+Bluetooth completion that can never arrive. Both hooks are removed after a
+successful teardown; a failed teardown deliberately keeps the module resident
+with its ownership state intact. Bluetooth handoff is not implemented in v1:
+an already-active BT worker prevents USB from taking the route, and USB should
+be unplugged before starting a new Bluetooth-audio session.
 
 A few details that matter if you go reading the source:
 
-- **Latency** is about 22 ms: 10 ms to fill a capture block, ~10 ms because the
-  consumer trails the producer by one block, plus 2 ms of USB contexts. The
-  block size is Sony's, not ours.
+- **Latency** is about 13 ms: 5 ms to fill a capture block, about 5 ms because
+  the consumer trails the producer by one block, plus 3 ms submitted to USB.
 - **The staging buffer is latest-wins, not a queue.** The capture worker isn't
   rate-locked to 48 kHz — it publishes whatever `ram_submit` returns, whenever it
   returns — so a FIFO underneath it thrashes. The seqlock lets the reader snap to
@@ -167,31 +172,27 @@ Verified by comparing decrypted modules: the two hooked function prologues, the
 are the same in all eight. Retail and devkit ship the same module — a retail
 3.65 console reports `0x55A6E312`, matching the 3.65 devkit dump.
 
-`SceAudio` is equally frozen across the same range: its export run begins at
-`+0x768C` and the three RAM-output entries hold identical addresses
-(`+0x2E81`, `+0x2ED9`, `+0x2F29`) on every one. Those are taken directly rather
-than resolved by NID at runtime.
+The three `SceAudio` RAM-output functions are module exports. They are
+resolved from the module's export table by NID at runtime; no SceAudio text
+offset is assumed.
 
 The NID list is enforced, not just documentation: a module NID outside it is
-refused and no hooks are installed. Firmware outside this range loses USB audio,
-but nothing else — the plugin and USB driver still load and the rest of the
-system is untouched.
+refused and no hooks are installed. Firmware outside this verified list loses
+USB audio, but nothing else — the plugin and USB driver still load and the rest
+of the system is untouched.
 
 Two gates run, in order:
 
 1. **Module NID** — identifies the exact build, and must be one of the eight.
-2. **Sanity checks** — the entry instruction of each hook site must still be
-   what was recorded; the `movw`/`movt` pair must decode as a valid pair
-   targeting the expected register; SceAudio's library NID must be present at
-   its export table; and both derived bases must be in range.
+2. **Small sanity check** — each hook entry must still contain the recorded
+   instruction and the `movw`/`movt` pair must decode for the expected register.
+   The three SceAudio function NIDs must resolve to Thumb entry points.
 
 The second gate is deliberately thin, because the NID has already pinned the
-firmware. Its remaining job is catching a module *modified after load* — if
-another plugin patches SceAVConfig, the NID is unchanged but the bytes are not,
-and hooking then would be hooking someone else's code. taiHEN patches a branch
-over the target's entry, so the entry instruction is what moves.
+firmware. It checks the two hook entries and the instruction pair used to derive
+the data base; it is not a general module-integrity scanner.
 
-Refusals are logged with the NID and the reason.
+Logging builds report an unverified NID and the validation boundary that failed.
 
 </details>
 
@@ -200,8 +201,8 @@ Refusals are logged with the NID and the reason.
 - `src/main.c` — module, system-event, and USB-driver lifetime.
 - `src/uac1.c` — UAC1 descriptor parsing, asynchronous device setup, and the
   session teardown worker.
-- `src/stream.c` — 2×480-frame PCM staging, 48-frame packetizer, and the
-  two-context scheduler with exactly one USB request in flight.
+- `src/stream.c` — 4×240-frame PCM staging, 48-frame packetizer, and the fixed
+  four-context scheduler with three USB requests in flight.
 - `src/audio_tap.c` — AVConfig route ownership, native A/B worker, DataSend-start
   hook, and virtual physical-stop acknowledgment.
 - `src/resolver.c` — taiHEN module lookup, firmware gate, and Sony function
@@ -245,8 +246,10 @@ After a full reboot:
 * OpenAI Codex — driver architecture, implementation, optimization, host-side
   tests, build tooling, and documentation.
 * Anthropic Claude — the v1.0 rework around AVConfig's RAM-output route and its
-  sleep/wake recovery fixes, plus v1.0.1's latency reduction, feeder
-  scheduling, and a seqlock memory-ordering fix in the PCM handoff.
+  sleep/wake recovery fixes; v1.0.1's latency reduction, feeder scheduling, and
+  a seqlock memory-ordering fix in the PCM handoff; and v1.1's disassembly-level
+  review of the 1 ms path, covering completion ordering, DMA page containment,
+  and the reservation-granule grouping of shared state.
 * [psvita-usb-audio-midi](https://github.com/intermynd-instruments/psvita-usb-audio-midi)
   — audio-processing reference work.
 * [TVIKEY](https://github.com/isage/tvikey) and

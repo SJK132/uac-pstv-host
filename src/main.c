@@ -27,6 +27,7 @@ int ksceKernelUnregisterSysEventHandler(SceUID handler_id);
 
 static int started;
 static int owns_usb_driver;
+static int suspend_seen;
 static SceUID sysevent_id = -1;
 
 static const SceUsbdDriver uac_driver = {
@@ -59,18 +60,21 @@ static int unregister_usb_driver(void)
 	return result;
 }
 
-/*
- * Suspend arrives as one descending sweep of resume=0 events, observed on this
- * firmware as 0x020F down to 0x0200 (then an unrelated 0x0401).  Gate on the
- * head of that sweep: it is the earliest notice, so the teardown worker gets
- * the most time before the system goes under, and acting once avoids relying on
- * request_cleanup() being idempotent across sixteen more events.
- *
- * A firmware whose sweep starts elsewhere simply never matches, which degrades
- * to the previous behaviour -- standby handled by the detach that follows --
- * rather than misfiring on a live session.
- */
-#define SYSEVENT_SUSPEND_HEAD 0x0000020Fu
+static int unregister_sysevent(void)
+{
+	int result;
+
+	if (sysevent_id < 0)
+		return 0;
+	result = ksceKernelUnregisterSysEventHandler(sysevent_id);
+	uac_log(LOG_PREFIX "sysevent unregister: 0x%08x\n", result);
+	if (result >= 0)
+		sysevent_id = -1;
+	return result;
+}
+
+/* Observed PSTV suspend event; duplicate delivery is collapsed below. */
+#define SYSEVENT_SUSPEND 0x0000020fu
 
 static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
 {
@@ -79,16 +83,51 @@ static int uac_sysevent_handler(int resume, int eventid, void *args, void *opt)
 	if (!__atomic_load_n(&started, __ATOMIC_ACQUIRE))
 		return 0;
 	if (resume) {
-		(void)ksceUsbServMacSelect(2, 0);
+		int result;
+
+		__atomic_store_n(&suspend_seen, 0, __ATOMIC_RELEASE);
+		result = ksceUsbServMacSelect(2, 0);
+		uac_log(LOG_PREFIX "USB host resume select: 0x%08x\n", result);
+		(void)result;
 		/*
 		 * Suspend may have cut a teardown short before the worker was
 		 * scheduled.  Poking it is cheap and no-ops when idle.
 		 */
 		uac1_resume_retry();
-	} else if ((uint32_t)eventid == SYSEVENT_SUSPEND_HEAD) {
+	} else if ((uint32_t)eventid == SYSEVENT_SUSPEND &&
+		!__atomic_exchange_n(&suspend_seen, 1, __ATOMIC_ACQ_REL)) {
 		uac1_suspend_session();
 	}
 	return 0;
+}
+
+/* Returning START_FAILED is safe only after every published callback is gone. */
+static int fail_start(void)
+{
+	int safe = 1;
+
+	uac1_lifecycle_quiesce();
+	if (unregister_usb_driver() < 0) {
+		uac1_lifecycle_accept();
+		__atomic_store_n(&started, 1, __ATOMIC_RELEASE);
+		return SCE_KERNEL_START_SUCCESS;
+	}
+	/* A registered sysevent is inert while started is clear, so later stages
+	 * may still be retired safely and module_stop can retry its unregister. */
+	if (unregister_sysevent() < 0)
+		safe = 0;
+	if (uac1_lifecycle_shutdown() < 0)
+		safe = 0;
+	if (safe && uac_stream_shutdown() < 0)
+		safe = 0;
+	if (safe && audio_tap_shutdown() < 0)
+		safe = 0;
+	if (!safe) {
+		uac_log(LOG_PREFIX "start rollback incomplete; staying resident\n");
+		return SCE_KERNEL_START_SUCCESS;
+	}
+	uac_log_close();
+	return SCE_KERNEL_START_FAILED;
 }
 
 int module_start(SceSize args, const void *argp)
@@ -126,29 +165,40 @@ int module_start(SceSize args, const void *argp)
 	}
 
 	result = uac_stream_init();
-	if (result < 0)
+	if (result < 0) {
+		if (uac_stream_shutdown() < 0)
+			return SCE_KERNEL_START_SUCCESS;
+		uac_log_close();
 		return SCE_KERNEL_START_FAILED;
+	}
 
 	/* The teardown worker must exist before any callback can request it. */
 	result = uac1_lifecycle_init();
 	if (result < 0) {
-		(void)uac_stream_shutdown();
+		uac1_lifecycle_quiesce();
+		if (uac1_lifecycle_shutdown() < 0 ||
+		    uac_stream_shutdown() < 0) {
+			uac_log(LOG_PREFIX
+				"lifecycle rollback incomplete; staying resident\n");
+			return SCE_KERNEL_START_SUCCESS;
+		}
+		uac_log_close();
 		return SCE_KERNEL_START_FAILED;
 	}
 
-	result = register_usb_driver();
-	if (result < 0) {
-		(void)uac1_lifecycle_shutdown();
-		(void)uac_stream_shutdown();
-		return SCE_KERNEL_START_FAILED;
-	}
-
-	__atomic_store_n(&started, 1, __ATOMIC_RELEASE);
 	result = ksceKernelRegisterSysEventHandler(
 		"uac_pstv_sysevent", uac_sysevent_handler, NULL);
 	uac_log(LOG_PREFIX "sysevent register: 0x%08x\n", result);
-	if (result >= 0)
-		sysevent_id = result;
+	if (result < 0)
+		return fail_start();
+	sysevent_id = result;
+
+	result = register_usb_driver();
+	if (result < 0) {
+		return fail_start();
+	}
+
+	__atomic_store_n(&started, 1, __ATOMIC_RELEASE);
 	return SCE_KERNEL_START_SUCCESS;
 }
 
@@ -162,19 +212,16 @@ int module_stop(SceSize args, const void *argp)
 	(void)args;
 	(void)argp;
 	__atomic_store_n(&started, 0, __ATOMIC_RELEASE);
+	uac1_lifecycle_quiesce();
 
 	usb_result = unregister_usb_driver();
 	if (usb_result < 0) {
+		uac1_lifecycle_accept();
 		__atomic_store_n(&started, 1, __ATOMIC_RELEASE);
 		return SCE_KERNEL_STOP_FAIL;
 	}
-	if (sysevent_id >= 0) {
-		int result = ksceKernelUnregisterSysEventHandler(sysevent_id);
-
-		if (result < 0)
-			return SCE_KERNEL_STOP_FAIL;
-		sysevent_id = -1;
-	}
+	if (unregister_sysevent() < 0)
+		return SCE_KERNEL_STOP_FAIL;
 	/* Driver and sysevent are gone, so no new teardown can be queued. */
 	lifecycle_result = uac1_lifecycle_shutdown();
 	if (lifecycle_result < 0)

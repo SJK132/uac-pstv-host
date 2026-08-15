@@ -9,7 +9,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   endif()
 endif()
 
-project(uac_pstv VERSION 1.0.1 LANGUAGES C)
+project(uac_pstv VERSION 1.1.0 LANGUAGES C)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 option(UAC_PSTV_ENABLE_LOGGING "Enable file and debug logging" OFF)

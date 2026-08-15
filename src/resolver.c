@@ -1,16 +1,14 @@
 /*
  * Locating Sony's private audio internals.
  *
- * Everything this plugin hooks is unexported: two SceAVConfig functions, a
- * handful of its private data fields, and three SceAudio RAM-output entry
- * points.  All are reached by fixed offset from their module's export table.
+ * SceAVConfig's route internals are private and profile-gated below.  SceAudio's
+ * three RAM-output functions are real exports, so they are resolved by NID
+ * instead of assuming their text offsets.
  *
- * Offsets are only safe because both modules' text is byte-identical across
- * every firmware in known_avconfig[] -- established by diffing the decrypted
- * modules, not assumed.  The module NID is the one thing that does differ
- * between builds, which is what makes it usable as the firmware gate: a NID not
- * in the table is refused outright rather than resolved on faith.  Extending
- * the range means verifying a new module and adding one row; see the README.
+ * AVConfig offsets are safe because its text is byte-identical across every
+ * firmware in known_avconfig[] -- established by diffing decrypted modules.
+ * An unlisted module NID is refused rather than resolved on faith.  SceAudio is
+ * independent of that profile: its three functions are resolved as exports.
  */
 
 #include "resolver.h"
@@ -26,16 +24,14 @@
 #define LOG_PREFIX "[uac-pstv-resolver] "
 
 /*
- * SceAudio is as frozen as SceAVConfig across 3.60-3.73: its export run starts
- * at the same place and the three RAM entries hold the same addresses, so they
- * are taken directly instead of walking the table by NID.  Offsets are odd
- * because the export table carries the Thumb bit, which these functions need.
+ * SceAudio is exported at this boundary.  Walking one export library is both
+ * shorter-lived and safer than pinning private text addresses: a firmware may
+ * move code while preserving these exported NIDs.
  */
 #define AUDIO_LIBRARY_NID 0x15D711C1u
-#define SCEAUDIO_EXPORTS_OFFSET 0x768Cu
-#define RAM_RATE_OFFSET 0x2E81u
-#define RAM_CHANNELS_OFFSET 0x2ED9u
-#define RAM_SUBMIT_OFFSET 0x2F29u
+#define RAM_RATE_NID 0x134C96C1u
+#define RAM_CHANNELS_NID 0xFC375BACu
+#define RAM_SUBMIT_NID 0x81EB0AE5u
 
 #define AVCONFIG_EXPORTS_OFFSET 0x4DFCu
 #define ROUTE_DIRTY_OFFSET 0x0050u
@@ -45,7 +41,8 @@
 #define ROUTE_LOCK_OFFSET 0x02ACu
 #define PAGE_A_OFFSET 0x0400u
 #define PAGE_B_OFFSET 0x0C00u
-#define RECV_WORKER_OFFSET 0x1400u
+/* 0x1400 is DataRecv configuration; its active flag is at 0x2440. */
+#define RECV_WORKER_OFFSET 0x2440u
 #define SEND_WORKER_OFFSET 0x1404u
 #define ROUTE_WAKE_OFFSET 0x14ECu
 #define CPU_UNLOCK_OFFSET 0x2FBCu
@@ -72,6 +69,23 @@ static const struct {
 	{ 0x5B294543u, "3.71" },
 	{ 0x136D0561u, "3.73" }
 };
+
+/* 32-bit SCE export-table header used by kernel modules. */
+typedef struct {
+	uint16_t size;
+	uint8_t version[2];
+	uint16_t attributes;
+	uint16_t function_count;
+	uint32_t variable_count;
+	uint32_t tls_variable_count;
+	uint32_t library_nid;
+	const char *library_name;
+	const uint32_t *nid_table;
+	const uintptr_t *entry_table;
+} ModuleExports;
+
+typedef char module_exports_size_must_be_0x20[
+	(sizeof(ModuleExports) == 0x20u) ? 1 : -1];
 
 /* Firmware name for a verified module NID, or NULL if we have not tested it. */
 static const char *known_firmware(uint32_t nid)
@@ -117,28 +131,54 @@ static uintptr_t decode_data_base(uintptr_t movw, uintptr_t movt, unsigned int r
 	return ((uintptr_t)half[1] << 16) | half[0];
 }
 
+static uintptr_t find_audio_export(const tai_module_info_t *module,
+	uint32_t function_nid)
+{
+	uintptr_t current = module->exports_start;
+
+	while (current < module->exports_end) {
+		const ModuleExports *exports = (const ModuleExports *)current;
+		uintptr_t available = module->exports_end - current;
+		uint32_t index;
+
+		if (available < sizeof(*exports) || exports->size < sizeof(*exports) ||
+		    exports->size > available)
+			return 0;
+		if (exports->library_nid == AUDIO_LIBRARY_NID) {
+			if (exports->nid_table == NULL || exports->entry_table == NULL ||
+			    ((uintptr_t)exports->nid_table & 3u) != 0u ||
+			    ((uintptr_t)exports->entry_table & 3u) != 0u)
+				return 0;
+			for (index = 0; index < exports->function_count; ++index) {
+				if (exports->nid_table[index] == function_nid)
+					return exports->entry_table[index];
+			}
+		}
+		current += exports->size;
+	}
+	return 0;
+}
+
 static int resolve_audio(AudioLayout *layout)
 {
 	tai_module_info_t module = {0};
-	uintptr_t text;
+	uintptr_t rate;
+	uintptr_t channels;
+	uintptr_t submit;
 
 	module.size = sizeof(module);
-	if (taiGetModuleInfoForKernel(KERNEL_PID, "SceAudio", &module) < 0)
+	if (taiGetModuleInfoForKernel(KERNEL_PID, "SceAudio", &module) < 0 ||
+	    module.exports_start == 0u || module.exports_start >= module.exports_end)
 		return -1;
-	/*
-	 * The AVConfig NID gate says nothing about this module, so confirm the one
-	 * thing that makes the hardcoded offsets meaningful: exports_start really
-	 * is SceAudio's export table.  Its library NID sits 16 bytes into the first
-	 * entry.  Without this the three pointers below are pure assumption, and
-	 * capture_worker calls them.
-	 */
-	if (module.exports_start < SCEAUDIO_EXPORTS_OFFSET ||
-	    *(const uint32_t *)(module.exports_start + 16u) != AUDIO_LIBRARY_NID)
+	rate = find_audio_export(&module, RAM_RATE_NID);
+	channels = find_audio_export(&module, RAM_CHANNELS_NID);
+	submit = find_audio_export(&module, RAM_SUBMIT_NID);
+	if ((rate & 1u) == 0u || (channels & 1u) == 0u || (submit & 1u) == 0u)
 		return -1;
-	text = module.exports_start - SCEAUDIO_EXPORTS_OFFSET;
-	layout->ram_rate = (AudioRamRateFn)(text + RAM_RATE_OFFSET);
-	layout->ram_channels = (AudioRamChannelsFn)(text + RAM_CHANNELS_OFFSET);
-	layout->ram_submit = (AudioRamSubmitFn)(text + RAM_SUBMIT_OFFSET);
+
+	layout->ram_rate = (AudioRamRateFn)rate;
+	layout->ram_channels = (AudioRamChannelsFn)channels;
+	layout->ram_submit = (AudioRamSubmitFn)submit;
 	return 0;
 }
 
@@ -155,6 +195,9 @@ int resolver_open(AudioLayout *layout)
 	layout->module_id = -1;
 	module.size = sizeof(module);
 	if (taiGetModuleInfoForKernel(KERNEL_PID, "SceAVConfig", &module) < 0)
+		return -1;
+	if (module.modid < 0 || module.exports_start == 0u ||
+	    module.exports_start >= module.exports_end)
 		return -1;
 	firmware = known_firmware(module.module_nid);
 	if (firmware == NULL) {
@@ -177,14 +220,20 @@ int resolver_open(AudioLayout *layout)
 	 * patches a branch over the entry, so the first instruction is what moves.
 	 */
 	if (read_u16(text + SEND_START_OFFSET) != 0xb5f8u ||
-	    read_u16(text + DEVICE_STOP_OFFSET) != 0xb510u)
+	    read_u16(text + DEVICE_STOP_OFFSET) != 0xb510u) {
+		uac_log(LOG_PREFIX "AVConfig %s hook entries failed validation\n",
+			firmware);
 		return -1;
+	}
 
 	/* Rejects both a failed decode (0) and a base that would underflow. */
 	data = decode_data_base(text + SEND_START_OFFSET + 0x26u,
 		text + SEND_START_OFFSET + 0x34u, 3u);
-	if (data < SEND_WORKER_OFFSET)
+	if (data < SEND_WORKER_OFFSET) {
+		uac_log(LOG_PREFIX "AVConfig %s data-base decode failed\n",
+			firmware);
 		return -1;
+	}
 	data -= SEND_WORKER_OFFSET;
 
 #define DATA_U32(off) ((volatile uint32_t *)(data + (off)))
@@ -207,6 +256,7 @@ int resolver_open(AudioLayout *layout)
 #undef DATA_U32
 
 	if (resolve_audio(layout) < 0) {
+		uac_log(LOG_PREFIX "SceAudio RAM exports unavailable\n");
 		resolver_close(layout);
 		return -1;
 	}

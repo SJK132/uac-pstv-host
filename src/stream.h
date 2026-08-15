@@ -6,14 +6,16 @@
  * feeder starts one whole block behind the newest, because blocks arrive in
  * discrete steps while the USB side drains continuously, so anything less runs
  * dry between arrivals.  Latency is therefore about two block periods plus the
- * two 1 ms transport contexts.  Must stay a whole number of USB packets; see
- * the assert in stream.c.
+ * three scheduled 1 ms USB requests.  Must stay a whole number of USB packets;
+ * see the assertions in stream.c.
  */
 #define UAC_STREAM_CAPTURE_FRAMES 240u
 #define UAC_STREAM_CAPTURE_BYTES (UAC_STREAM_CAPTURE_FRAMES * 4u)
 
 int uac_stream_init(void);
 int uac_stream_publish(const void *pcm);
+/* Report an asynchronous source failure without blocking its worker. */
+void uac_stream_source_failed(int result);
 int uac_stream_start(int pipe_id);
 void uac_stream_stop(void);
 void uac_stream_pipe_closed(int pipe_id);

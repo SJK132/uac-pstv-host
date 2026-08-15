@@ -2,13 +2,13 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-build_dir="${BUILD_DIR:-/tmp/uac-pstv-build}"
+build_dir="$(mktemp -d "${TMPDIR:-/tmp}/uac-pstv.XXXXXX")"
+trap 'rm -rf -- "$build_dir"' EXIT
 
 : "${VITASDK:=/usr/local/vitasdk}"
 export VITASDK
 export PATH="$VITASDK/bin:$PATH"
 
-rm -rf "$build_dir"
 cmake -S "$project_dir" -B "$build_dir" \
   -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Release
