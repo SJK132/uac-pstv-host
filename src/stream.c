@@ -154,11 +154,12 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
 	slice_count_must_be_a_power_of_two_above_three);
 /*
- * Room on both sides for the whole excursion, not the pin alone: latest advances
- * one slice mid-block while the cursor holds still, so the separation runs
- * PCM_TRAIL to PCM_TRAIL + 1.  The DMA below, being lapped above.
+ * Room on both sides.  Two slots are spoken for at any instant -- the one in
+ * Sony's mailbox and the one claimed during the block period we hold the cursor
+ * for -- so the cursor may not sit at COUNT - 1 or COUNT - 2 behind latest,
+ * which is exactly COUNT - 3.  The mailbox sets the floor at one.
  */
-STATIC_ASSERT(PCM_TRAIL >= 1u && PCM_TRAIL + 1u <= UAC_STREAM_SLICE_COUNT - 3u,
+STATIC_ASSERT(PCM_TRAIL >= 1u && PCM_TRAIL <= UAC_STREAM_SLICE_COUNT - 3u,
 	pinned_trail_must_clear_the_dma_and_the_lap);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
