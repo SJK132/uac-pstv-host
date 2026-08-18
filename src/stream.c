@@ -4,7 +4,7 @@
  * Two halves that meet in the middle:
  *
  *   - the source side is Sony's own audio engine, writing captured PCM into
- *     four slices of AVConfig's RAM-output region;
+ *     slices of AVConfig's RAM-output region;
  *   - the transport side runs one feeder thread that cuts those slices into
  *     48-frame (1 ms) packets and keeps three isochronous requests in flight,
  *     with one context staged behind them.
@@ -43,12 +43,20 @@
 #define SONY_ISO_PACKET_SLOTS 8u
 #define PCM_SLICE_MASK (UAC_STREAM_SLICE_COUNT - 1u)
 /*
- * One slice is always being filled, so the cursor may trail the newest
- * complete slice by at most two before the one under it is the one Sony is
- * overwriting.  This was already the true limit when staging was a private
- * copy; it was just masked by the copy finishing in microseconds.
+ * How far the cursor may trail the newest complete slice.
+ *
+ * Three slices are spoken for, not one.  ram_submit()'s mailbox holds the slice
+ * claimed this iteration while Sony is still filling the one claimed last
+ * iteration, so two are unreadable at any instant; the third is latest itself,
+ * which trail counts from.  Claiming happens before the following publish
+ * advances latest, so the oldest readable slice goes odd while latest still
+ * names the older value -- which is why this is COUNT - 3 and not COUNT - 2.
+ *
+ * A private staging copy did not pay this: its write window was a memcpy, so
+ * only one slot was ever briefly unreadable.  Slices are held for a whole block
+ * period instead, and the depth has to cover it.
  */
-#define PCM_MAX_TRAIL (UAC_STREAM_SLICE_COUNT - 2u)
+#define PCM_MAX_TRAIL (UAC_STREAM_SLICE_COUNT - 3u)
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -124,9 +132,9 @@ STATIC_ASSERT(UAC_ERG != 0u && (UAC_ERG & (UAC_ERG - 1u)) == 0u,
 
 STATIC_ASSERT(UAC_STREAM_CAPTURE_BYTES <= UAC_STREAM_SLICE_BYTES,
 	capture_block_must_fit_one_slice);
-STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 2u &&
+STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
-	slice_count_must_be_a_power_of_two_above_two);
+	slice_count_must_be_a_power_of_two_above_three);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
@@ -282,18 +290,20 @@ typedef struct {
 } __attribute__((aligned(UAC_ERG))) PcmCursor;
 
 /*
- * sizeof catches a group outgrowing its granule, or the aligned attribute
- * written in the place that raises alignof without padding.  _Alignof catches
- * one starting mid-granule, which straddles two of them however big it is.
+ * A group must occupy whole granules and start on one, so nothing outside it
+ * can ever share.  sizeof catches the aligned attribute written in the place
+ * that raises alignof without padding -- 24 bytes claiming 32-byte alignment
+ * leaves the tail free for GCC to pack into.  _Alignof catches a group starting
+ * mid-granule, which straddles two of them however big it is.
  */
-#define MUST_OWN_ONE_GRANULE(type, tag) \
-	STATIC_ASSERT(sizeof(type) == UAC_ERG, tag##_must_fill_one_granule); \
+#define MUST_OWN_WHOLE_GRANULES(type, tag) \
+	STATIC_ASSERT(sizeof(type) % UAC_ERG == 0u, tag##_must_fill_its_granules); \
 	STATIC_ASSERT(_Alignof(type) == UAC_ERG, tag##_must_start_on_a_granule)
 
-MUST_OWN_ONE_GRANULE(TxPump, tx_pump);
-MUST_OWN_ONE_GRANULE(CallbackLifetime, callback_lifetime);
-MUST_OWN_ONE_GRANULE(PcmSource, pcm_source);
-MUST_OWN_ONE_GRANULE(PcmCursor, pcm_cursor);
+MUST_OWN_WHOLE_GRANULES(TxPump, tx_pump);
+MUST_OWN_WHOLE_GRANULES(CallbackLifetime, callback_lifetime);
+MUST_OWN_WHOLE_GRANULES(PcmSource, pcm_source);
+MUST_OWN_WHOLE_GRANULES(PcmCursor, pcm_cursor);
 
 static TxPump tx = { .pipe = -1 };
 static CallbackLifetime cb;
