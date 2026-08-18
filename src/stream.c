@@ -830,6 +830,21 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 		/* Lapped: Sony is overwriting the slice we were reading. */
 		COUNT_RESYNC(gap);
 		pcm_resync(latest);
+	} else if (gap < PCM_MIN_TRAIL) {
+		/*
+		 * Caught up.  The trail is a random walk between two clocks -- the
+		 * USB frame timer and Sony's -- and without this it has a fence
+		 * only at the top: drifting down to zero leaves the cursor reading
+		 * the slice being DMA'd, where guard[] is even so the copy
+		 * succeeds torn, gap is far under PCM_MAX_TRAIL so no resync
+		 * fires, and it cannot advance past latest.  An absorbing state,
+		 * and the reason a bad spot outlives everything but a replug.
+		 *
+		 * Not a resync: nothing has been lost, the slice simply is not
+		 * safely readable yet.  Waiting lets the producer pull ahead and
+		 * shows up as a pcm wait, which is what it is.
+		 */
+		return 1;
 	}
 
 	if (!pcm_copy(cur.sequence, cur.offset, packet)) {
