@@ -52,14 +52,19 @@
  * can leave the reader behind, because the reader has no position of its own to
  * fall behind with.  It is wherever the writer says it is.
  *
- * Two is the floor.  "Complete" is optimistic: ram_submit() returns once the
- * previous buffer has left Sony's one-deep mailbox, and the mailbox is cleared
- * while the DMA descriptor is being programmed rather than when the transfer
- * finishes, so latest - 1 can still be under the engine's pen with guard[]
- * saying otherwise.  Sitting at the floor means no margin above that reasoning:
- * if "complete" is optimistic by one more slice than believed, it tears.
+ * One is the floor, and this sits on it.  ram_submit() returns once the previous
+ * buffer has left Sony's one-deep mailbox, so publishing latest means the engine
+ * has just taken that block -- latest is the slice under the pen, not a finished
+ * one, and latest - 1 is the first block the engine can be argued to have let
+ * go of.  Two slices behind the pen, exactly.
+ *
+ * There is no margin left above that argument.  If the engine ever holds a block
+ * one longer than the mailbox implies, this reads it mid-write, and guard[] will
+ * not say so: the slot was marked complete a block ago and is not reclaimed for
+ * another seven, so the seqlock passes and every counter stays clean.  The only
+ * symptom would be continuous distortion.
  */
-#define PCM_TRAIL 2u
+#define PCM_TRAIL 1u
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -153,7 +158,7 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
  * one slice mid-block while the cursor holds still, so the separation runs
  * PCM_TRAIL to PCM_TRAIL + 1.  The DMA below, being lapped above.
  */
-STATIC_ASSERT(PCM_TRAIL >= 2u && PCM_TRAIL + 1u <= UAC_STREAM_SLICE_COUNT - 3u,
+STATIC_ASSERT(PCM_TRAIL >= 1u && PCM_TRAIL + 1u <= UAC_STREAM_SLICE_COUNT - 3u,
 	pinned_trail_must_clear_the_dma_and_the_lap);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
