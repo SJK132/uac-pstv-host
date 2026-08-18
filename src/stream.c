@@ -265,15 +265,13 @@ typedef struct {
  *
  * index is the slot sequence occupies, carried rather than derived from it.
  * That is what lets COUNT be seven: no modulo on any path, and no discontinuity
- * when the sequence wraps, since the two are unrelated.  The reader cannot
- * count its way to a slot after resyncing, so latest_index is published beside
- * latest -- unsynchronised, because guard[] still carries the sequence and an
- * inconsistent pair simply fails the check.
+ * when the sequence wraps, since the two are unrelated.  Nothing publishes it,
+ * because guard[] already says which slot holds which sequence -- see
+ * pcm_resync(), which is the only reader that has to ask.
  */
 typedef struct {
 	void *base;
 	uint32_t latest;
-	uint32_t latest_index;
 	uint32_t sequence;
 	uint32_t previous;
 	uint32_t index;
@@ -472,10 +470,6 @@ void uac_stream_capture_ready(void)
 		return;
 	index = prev_slice(src.index);
 	__atomic_store_n(&src.guard[index], sequence << 1, __ATOMIC_RELEASE);
-	/* Index first: a reader that acquires latest then sees a newer index has
-	 * an inconsistent pair, which guard[] rejects.  The reverse could hand it
-	 * a stale slot that passes. */
-	__atomic_store_n(&src.latest_index, index, __ATOMIC_RELAXED);
 	__atomic_store_n(&src.latest, sequence, __ATOMIC_RELEASE);
 	signal_pcm();
 }
@@ -789,17 +783,32 @@ static int pcm_copy(uint8_t *packet)
 	return 0;
 }
 
-/* Land one slice behind the newest complete one, which is the design point:
- * closer has no room to fall behind, further spends slack for nothing. */
+/*
+ * Land one slice behind the newest complete one, which is the design point:
+ * closer has no room to fall behind, further spends slack for nothing.
+ *
+ * The slot comes from guard[], the only thing that actually knows which slice
+ * holds which sequence.  Asking it costs a scan of seven words on a path taken
+ * a handful of times per session, and saves publishing a second copy of the
+ * mapping that could disagree with this one.  If the slice has already been
+ * reclaimed, no guard matches, cur.index keeps its old value and pcm_copy fails
+ * -- the same outcome as any other stale read, and the caller retries.
+ */
 static void pcm_resync(uint32_t latest)
 {
-	uint32_t index = __atomic_load_n(&src.latest_index, __ATOMIC_ACQUIRE);
+	uint32_t index;
 
 	/* Sequence 1 is startup when invalid, and follows UINT32_MAX at wrap. */
 	cur.sequence = latest == 1u ? (cur.valid ? UINT32_MAX : 1u) : latest - 1u;
-	cur.index = prev_slice(index);
 	cur.offset = 0;
 	cur.valid = latest != 0;
+	for (index = 0; index < UAC_STREAM_SLICE_COUNT; ++index) {
+		if (__atomic_load_n(&src.guard[index], __ATOMIC_ACQUIRE) ==
+		    cur.sequence << 1) {
+			cur.index = index;
+			return;
+		}
+	}
 }
 
 /* Forward distance on the 1..UINT32_MAX sequence ring; zero if not ahead. */
