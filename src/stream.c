@@ -77,21 +77,6 @@
  */
 #define CONTEXT_COUNT 4u
 #define MAX_IN_FLIGHT 3u
-/*
- * Refill rate after a pipe freeze.
- *
- * A freeze is one wrap of the 256-entry periodic frame list -- 256 frames, and
- * the resync gaps measure it as exactly that -- and it ends with every
- * outstanding request completing at once.  Refilling all of them back to back
- * costs 780-1515 us of a 1 ms frame, because ksceUsbdIsochronousTransfer() runs
- * 260-505 us, so the burst overruns the frame and earns another freeze.  That
- * is self-sustaining, and it is why the bad state outlives the downclock that
- * started it: the clock caused the first miss, the burst causes the rest.
- *
- * So refill one per frame until the schedule has re-anchored.  Steady state is
- * untouched, since one completion per frame already submits one.
- */
-#define FREEZE_GAP_US 50000u
 
 /*
  * USBD may deliver a completion after its pipe has been closed and the static
@@ -268,9 +253,6 @@ typedef struct {
 	/* Coalesces feeder and callback requests while admitting one pumper. */
 	uint32_t pump_requests;
 	int primed;
-	/* Cap on in_flight: drops to one after a freeze, climbs back a frame at
-	 * a time.  Written only by the completion, read by both pumpers. */
-	uint32_t refill;
 } __attribute__((aligned(UAC_ERG))) TxPump;
 
 /*
@@ -280,10 +262,10 @@ typedef struct {
  */
 typedef struct {
 	uint32_t guard;
-	/* When the last completion arrived, and whether there was one.  Only
-	 * transfer_done touches these, on USBD's single callback thread. */
+#ifdef UAC_PSTV_ENABLE_LOGGING
 	uint32_t completion_at;
 	int completion_seen;
+#endif
 } __attribute__((aligned(UAC_ERG))) CallbackLifetime;
 
 /*
@@ -379,6 +361,12 @@ static SceUID feeder_thread = -1;
  */
 #ifdef UAC_PSTV_ENABLE_LOGGING
 #define RESYNC_LOG_MAX 8u
+/*
+ * A completion gap this long is not jitter.  The pipe stops for one wrap of the
+ * 256-entry periodic frame list, 256 frames, which is exactly what the resync
+ * gaps measure, so any threshold well inside that separates the two cleanly.
+ */
+#define FREEZE_GAP_US 50000u
 static uint32_t starve_count;
 static uint32_t submit_count;
 static uint32_t pcm_wait_count;
@@ -389,7 +377,6 @@ static uint32_t resync_gap[RESYNC_LOG_MAX];
 #define COUNT_STARVE() __atomic_add_fetch(&starve_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_SUBMIT() __atomic_add_fetch(&submit_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_PCM_WAIT() __atomic_add_fetch(&pcm_wait_count, 1u, __ATOMIC_RELAXED)
-#define COUNT_FREEZE() __atomic_add_fetch(&freeze_count, 1u, __ATOMIC_RELAXED)
 /*
  * Stored rather than logged inline, because uac_log() writes to the filesystem
  * and doing that from pcm_next() would stall the feeder and manufacture the
@@ -405,23 +392,15 @@ static uint32_t resync_gap[RESYNC_LOG_MAX];
 	resync_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED); \
 	resync_gap[n] = (gap); \
 } while (0)
-#else
-#define COUNT_STARVE() ((void)0)
-#define COUNT_SUBMIT() ((void)0)
-#define COUNT_PCM_WAIT() ((void)0)
-#define COUNT_FREEZE() ((void)0)
-#define COUNT_RESYNC(gap) ((void)0)
-#endif
-
 /*
- * Watch the interval between completions and set the refill cap from it.  Not
- * instrumentation -- release needs this too, because the cap is what keeps a
- * freeze from re-arming itself.
+ * Separates a frozen pipe from a lapped consumer.  A resync says the cursor
+ * fell behind; it does not say whether the transport stopped or the producer
+ * ran away.  Counting completion gaps says which, and the two counts read
+ * together are what a session line is for.
  */
-static void track_refill(void)
+static void track_freeze(void)
 {
 	uint32_t now = ksceKernelGetSystemTimeLow();
-	uint32_t refill;
 	uint32_t gap;
 
 	if (!cb.completion_seen) {
@@ -432,16 +411,19 @@ static void track_refill(void)
 	/* Unsigned difference stays correct across the counter's ~71 min wrap. */
 	gap = now - cb.completion_at;
 	cb.completion_at = now;
-	if (gap >= FREEZE_GAP_US) {
-		COUNT_FREEZE();
-		__atomic_store_n(&tx.refill, 1u, __ATOMIC_RELEASE);
-		return;
-	}
-	/* One more per frame that arrives on time, until the pipe is full again. */
-	refill = __atomic_load_n(&tx.refill, __ATOMIC_RELAXED);
-	if (refill < MAX_IN_FLIGHT)
-		__atomic_store_n(&tx.refill, refill + 1u, __ATOMIC_RELEASE);
+	if (gap >= FREEZE_GAP_US)
+		__atomic_add_fetch(&freeze_count, 1u, __ATOMIC_RELAXED);
 }
+#define TRACK_FREEZE() track_freeze()
+#define RESET_FREEZE() (cb.completion_seen = 0)
+#else
+#define COUNT_STARVE() ((void)0)
+#define COUNT_SUBMIT() ((void)0)
+#define COUNT_PCM_WAIT() ((void)0)
+#define COUNT_RESYNC(gap) ((void)0)
+#define TRACK_FREEZE() ((void)0)
+#define RESET_FREEZE() ((void)0)
+#endif
 
 static uint32_t next_generation(void)
 {
@@ -678,7 +660,7 @@ static void pump_ready(void)
 		while (stream_running() &&
 		       __atomic_load_n(&tx.primed, __ATOMIC_ACQUIRE) &&
 		       __atomic_load_n(&tx.in_flight, __ATOMIC_ACQUIRE) <
-		       __atomic_load_n(&tx.refill, __ATOMIC_ACQUIRE)) {
+		       MAX_IN_FLIGHT) {
 			StreamContext *context = claim_oldest_ready();
 			int submitted;
 
@@ -733,9 +715,7 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
 	if (!stream_running())
 		goto out;
 
-	/* Before pump_ready(), so this completion's interval sets the cap the
-	 * refill below is about to obey. */
-	track_refill();
+	TRACK_FREEZE();
 
 	status = ((SonyIsoTransfer *)(void *)sdk_transfer)->packets[0].status;
 	if (result < 0 || status != USBD_CC_NOERR) {
@@ -1092,9 +1072,7 @@ int uac_stream_start(int pipe_id)
 	__atomic_store_n(&tx.pump_requests, 0u, __ATOMIC_RELEASE);
 	__atomic_store_n(&cur.write_sequence, 0u, __ATOMIC_RELEASE);
 	__atomic_store_n(&tx.primed, 0, __ATOMIC_RELEASE);
-	/* A fresh pipe has a fresh schedule, so start full rather than ramping. */
-	__atomic_store_n(&tx.refill, MAX_IN_FLIGHT, __ATOMIC_RELEASE);
-	cb.completion_seen = 0;
+	RESET_FREEZE();
 	memset(contexts, 0, sizeof(contexts));
 
 	/*
