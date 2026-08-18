@@ -65,14 +65,14 @@ so the plugin borrows Sony's own path for it.
 
 `SceAVConfig` already knows how to render system audio into a RAM buffer instead
 of sending it to HDMI — that's the route it uses to feed Bluetooth audio. The
-plugin claims that route for itself, then runs a worker that rotates seven
-144-frame slices through Sony's `SceAudio` RAM-output function, so Sony's own
-engine writes the staging buffer directly rather than a private copy of it. A
-seqlock guard word per slice marks which ones are complete.
+plugin claims that route for itself, then runs a worker that hands Sony's
+`SceAudio` RAM-output function a pair of 240-frame buffers in ping-pong. Captured
+PCM lands in a four-slot seqlock staging buffer. The smaller page was validated
+on hardware; the Sony RAM-output contract itself is otherwise unchanged.
 
 On the USB side, a UAC1 driver enumerates the device, walks its descriptors to
 find a stream interface it can actually drive, selects the alternate setting and
-sets the sample rate. A feeder thread cuts those 144-frame slices into
+sets the sample rate. A feeder thread slices the staged 240-frame blocks into
 48-frame (192-byte) packets and rotates four fixed isochronous contexts: three
 owned by USBD and one READY or being prepared. The completion callback submits
 the oldest READY context before waking the feeder, keeping the periodic USB
@@ -89,9 +89,9 @@ be unplugged before starting a new Bluetooth-audio session.
 
 A few details that matter if you go reading the source:
 
-- **Latency** is about 9 ms: 3 ms to fill a capture slice, about 3 ms because
-  the consumer trails the producer by one slice, plus 3 ms submitted to USB.
-- **Staging is latest-wins, not a queue.** The capture worker isn't
+- **Latency** is about 13 ms: 5 ms to fill a capture block, about 5 ms because
+  the consumer trails the producer by one block, plus 3 ms submitted to USB.
+- **The staging buffer is latest-wins, not a queue.** The capture worker isn't
   rate-locked to 48 kHz — it publishes whatever `ram_submit` returns, whenever it
   returns — so a FIFO underneath it thrashes. The seqlock lets the reader snap to
   the freshest block instead.
@@ -195,10 +195,10 @@ so a power cycle always restores it — but that is the one case that needs one.
 - `src/main.c` — module, system-event, and USB-driver lifetime.
 - `src/uac1.c` — UAC1 descriptor parsing and the three USB driver callbacks.
 - `src/session.c` — the session thread: device setup, route handover, teardown.
-- `src/stream.c` — 7×144-frame slice staging, 48-frame packetizer, and the fixed
+- `src/stream.c` — 4×240-frame PCM staging, 48-frame packetizer, and the fixed
   four-context scheduler with three USB requests in flight.
-- `src/audio_tap.c` — AVConfig route ownership, the slice-rotating capture worker,
-  the DataSend-start hook, and virtual physical-stop acknowledgment.
+- `src/audio_tap.c` — AVConfig route ownership, native A/B worker, DataSend-start
+  hook, and virtual physical-stop acknowledgment.
 - `src/resolver.c` — taiHEN module lookup, firmware gate, and Sony function
   resolution.
 - `src/log.c` — debug-only logging; absent from release builds.

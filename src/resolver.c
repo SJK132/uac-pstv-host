@@ -13,8 +13,6 @@
  */
 #include "resolver.h"
 
-#include "stream.h"
-
 #include "log.h"
 
 #include <stddef.h>
@@ -48,18 +46,11 @@
 #define SELECTED_TARGET_OFFSET 0x00E0u
 #define ROUTE_WORD_OFFSET 0x0248u
 #define ROUTE_LOCK_OFFSET 0x02ACu
-/*
- * Pages A and B are contiguous -- 0x400 and 0xC00, 0x800 each -- so stream.c
- * treats the pair as one region and cuts its own slices from it.  The assert is
- * the one that matters: overrunning it writes into AVConfig's live state.
- */
-#define CAPTURE_BASE_OFFSET 0x0400u
+#define PAGE_A_OFFSET 0x0400u
+#define PAGE_B_OFFSET 0x0C00u
 /* 0x1400 is DataRecv configuration; its active flag is at 0x2440. */
 #define RECV_WORKER_OFFSET 0x2440u
 #define SEND_WORKER_OFFSET 0x1404u
-_Static_assert(CAPTURE_BASE_OFFSET +
-	UAC_STREAM_SLICE_BYTES * UAC_STREAM_SLICE_COUNT <= SEND_WORKER_OFFSET,
-	"capture slices overrun AVConfig's send_worker_active");
 #define ROUTE_WAKE_OFFSET 0x14ECu
 #define CPU_UNLOCK_OFFSET 0x2FBCu
 #define CPU_LOCK_OFFSET 0x2FCCu
@@ -221,7 +212,8 @@ int resolver_open(AudioLayout *layout)
 	layout->send_worker_active = DATA_U32(SEND_WORKER_OFFSET);
 	layout->recv_worker_active = DATA_U32(RECV_WORKER_OFFSET);
 	layout->route_lock = (void *)(data + ROUTE_LOCK_OFFSET);
-	layout->capture_base = (void *)(data + CAPTURE_BASE_OFFSET);
+	layout->page[0] = (void *)(data + PAGE_A_OFFSET);
+	layout->page[1] = (void *)(data + PAGE_B_OFFSET);
 	/* cpu_lock/cpu_unlock are ARM import stubs; route_wake is Thumb code. */
 	layout->cpu_lock = (AudioCpuLockFn)(text + CPU_LOCK_OFFSET);
 	layout->cpu_unlock = (AudioCpuUnlockFn)(text + CPU_UNLOCK_OFFSET);
