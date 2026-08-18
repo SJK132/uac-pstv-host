@@ -6,14 +6,37 @@
  * feeder starts one whole block behind the newest, because blocks arrive in
  * discrete steps while the USB side drains continuously, so anything less runs
  * dry between arrivals.  Latency is therefore about two block periods plus the
- * three scheduled 1 ms USB requests.  Must stay a whole number of USB packets;
- * see the assertions in stream.c.
+ * three scheduled 1 ms USB requests.  Must stay a whole number of USB packets
+ * and fit one slice; see the assertions in stream.c.
  */
-#define UAC_STREAM_CAPTURE_FRAMES 240u
+#define UAC_STREAM_CAPTURE_FRAMES 96u
 #define UAC_STREAM_CAPTURE_BYTES (UAC_STREAM_CAPTURE_FRAMES * 4u)
 
+/*
+ * Staging is AVConfig's own 0x1000 RAM-output region, cut into slices Sony's
+ * engine fills directly.  Count buys stall tolerance -- three slices are always
+ * spoken for, leaving COUNT - 3 block periods of slack -- while a smaller block
+ * costs one more capture wakeup, each of which preempts the feeder on its own
+ * core.  Eight 96-frame slices give five, or 10 ms, at 500 Hz.
+ *
+ * The stride is not the block size.  Sony's DMA rounds its write up to a
+ * 256-byte multiple, so a slice has to hold the rounded figure or it spills
+ * into the next one -- which is audible as distortion rather than a click,
+ * because the corruption is continuous.  stream.c asserts it; resolver.c
+ * asserts that the region holds them all.
+ */
+#define UAC_STREAM_SLICE_BYTES 0x200u
+#define UAC_STREAM_SLICE_COUNT 8u
+
 int uac_stream_init(void);
-int uac_stream_publish(const void *pcm);
+
+/* Capture rotation, driven by audio_tap. claim() marks the next slice in flight
+ * and returns its address for ram_submit(); ready() is called once that submit
+ * returns, which is what proves the slice before it is complete. */
+void uac_stream_capture_region(void *base);
+void *uac_stream_capture_claim(void);
+void uac_stream_capture_ready(void);
+
 /* Report an asynchronous source failure without blocking its worker. */
 void uac_stream_source_failed(int result);
 int uac_stream_start(int pipe_id);
