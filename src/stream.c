@@ -43,32 +43,24 @@
 #define SONY_ISO_PACKET_SLOTS 8u
 #define PCM_SLICE_MASK (UAC_STREAM_SLICE_COUNT - 1u)
 /*
- * Two slices are unreadable at any instant -- ram_submit()'s mailbox holds one
- * queued while Sony fills another -- and the third is latest itself, which
- * trail counts from.  Hence COUNT - 3, not COUNT - 2.
- */
-#define PCM_MAX_TRAIL (UAC_STREAM_SLICE_COUNT - 3u)
-/*
- * How close to latest the cursor may ever sit.
+ * How far behind latest the cursor is pinned, in slices.
  *
- * "Complete" is optimistic: ram_submit() returns once the previous buffer has
- * left Sony's one-deep mailbox, and the mailbox is cleared while the DMA
- * descriptor is being programmed rather than when the transfer finishes.  A
- * cursor at latest - 1 can be reading a slice still being written with guard[]
- * saying it is safe, which tears silently -- pcm_copy succeeds, no counter
- * moves, and it is audible only as distortion.
- */
-#define PCM_MIN_TRAIL 2u
-/*
- * Where a resync lands: the middle of the readable window, not either edge.
+ * The cursor does not advance on its own.  It is re-derived from latest at
+ * every slice boundary, so its distance from Sony's engine is a constant of the
+ * design rather than the state of a random walk between two unrelated clocks.
  *
- * Landing at a fixed distance from one edge is what lets a bad phase persist.
- * Drift carries the cursor toward whichever edge it started nearest, and every
- * resync drops it back at the same place, so it re-enters the same collision
- * within a few slices.  Centring gives drift in either direction the same room,
- * and costs one slice of latency over sitting at PCM_MIN_TRAIL.
+ * Two is the floor.  "Complete" is optimistic: ram_submit() returns once the
+ * previous buffer has left Sony's one-deep mailbox, and the mailbox is cleared
+ * while the DMA descriptor is being programmed rather than when the transfer
+ * finishes, so latest - 1 can still be under the engine's pen with guard[]
+ * saying otherwise.  COUNT - 3 is the ceiling: one slice is in flight, one is
+ * latest, and one is the slot about to be reclaimed.
+ *
+ * Three sits in the middle, and because latest advances once per slice while
+ * the cursor holds still, the real distance breathes between three and four --
+ * never below the floor, never at the ceiling.
  */
-#define PCM_RESYNC_TRAIL ((PCM_MIN_TRAIL + PCM_MAX_TRAIL) / 2u)
+#define PCM_TRAIL 3u
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -157,9 +149,13 @@ STATIC_ASSERT(UAC_STREAM_SLICE_BYTES >=
 STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
 	slice_count_must_be_a_power_of_two_above_three);
-/* Room on both sides: clear of the DMA below, clear of being lapped above. */
-STATIC_ASSERT(PCM_RESYNC_TRAIL >= PCM_MIN_TRAIL &&
-	PCM_RESYNC_TRAIL < PCM_MAX_TRAIL, resync_must_land_inside_the_window);
+/*
+ * Room on both sides.  The pin sits at PCM_TRAIL and drifts one slice further
+ * out before the next boundary pulls it back, so both ends of that breath have
+ * to clear: the DMA below, being lapped above.
+ */
+STATIC_ASSERT(PCM_TRAIL >= 2u && PCM_TRAIL + 1u <= UAC_STREAM_SLICE_COUNT - 3u,
+	pinned_trail_must_clear_the_dma_and_the_lap);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
@@ -349,54 +345,72 @@ static SceUID feeder_thread = -1;
  *
  *   starve   the transport won the right to submit and found the next context
  *            unfilled, so the isochronous stream gets a hole.  Audible.
- *   pcm wait the feeder had a context but no PCM to put in it.  Absorbed by the
- *            staged contexts; not audible by itself.
- *   resync   the producer lapped the slice being read and the cursor jumped to
- *            current audio.  Audible, and the one that matters most.  Its gap
- *            says what caused it: two or three slices is ordinary jitter, fifty
- *            is one of the 250 ms whole-pipe USB stalls.
+ *   pcm wait the feeder had a context but no PCM to put in it.  With a pinned
+ *            cursor this means pcm_copy() found the guard in flight, which the
+ *            pin is supposed to make impossible.
+ *   slip     the pin did not land on the slice after the one just played.
+ *            Positive skipped a slice, negative will repeat one.  Audible, and
+ *            the direct measure of the two clocks disagreeing.
+ *   freeze   completions stopped arriving for long enough that the pipe, not
+ *            the producer, is what went quiet.
  *
  * These swing by orders of magnitude between runs of the same binary, so read
  * patterns across several sessions and never conclude anything from one number.
  */
 #ifdef UAC_PSTV_ENABLE_LOGGING
-#define RESYNC_LOG_MAX 8u
+#define SLIP_LOG_MAX 8u
 /*
  * A completion gap this long is not jitter.  The pipe stops for one wrap of the
- * 256-entry periodic frame list, 256 frames, which is exactly what the resync
- * gaps measure, so any threshold well inside that separates the two cleanly.
+ * 256-entry periodic frame list, 256 frames, so any threshold well inside that
+ * separates a frozen pipe from ordinary scheduling noise.
  */
 #define FREEZE_GAP_US 50000u
 static uint32_t starve_count;
 static uint32_t submit_count;
 static uint32_t pcm_wait_count;
-static uint32_t resync_count;
+static uint32_t slip_count;
 static uint32_t freeze_count;
-static uint32_t resync_at[RESYNC_LOG_MAX];
-static uint32_t resync_gap[RESYNC_LOG_MAX];
+static uint32_t slip_at[SLIP_LOG_MAX];
+static int32_t slip_delta[SLIP_LOG_MAX];
 #define COUNT_STARVE() __atomic_add_fetch(&starve_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_SUBMIT() __atomic_add_fetch(&submit_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_PCM_WAIT() __atomic_add_fetch(&pcm_wait_count, 1u, __ATOMIC_RELAXED)
+
+/* Forward distance on the 1..UINT32_MAX sequence ring; zero if not ahead. */
+static uint32_t pcm_ahead_by(uint32_t newer, uint32_t older)
+{
+	uint32_t distance = newer - older;
+
+	if ((int32_t)distance <= 0)
+		return 0;
+	return newer < older ? distance - 1u : distance;
+}
+
 /*
  * Stored rather than logged inline, because uac_log() writes to the filesystem
- * and doing that from pcm_next() would stall the feeder and manufacture the
- * very problem being measured.
+ * and doing that from the feeder would stall it and manufacture the very
+ * problem being measured.
  *
  * A ring, so what survives is the last few rather than the first few.  Once
- * resyncs start repeating, the opening ones are all onset and say nothing about
+ * slips start repeating, the opening ones are all onset and say nothing about
  * the state it settles into.
  */
-#define COUNT_RESYNC(gap) do { \
-	uint32_t n = __atomic_fetch_add(&resync_count, 1u, __ATOMIC_RELAXED) % \
-		RESYNC_LOG_MAX; \
-	resync_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED); \
-	resync_gap[n] = (gap); \
-} while (0)
+static void record_slip(uint32_t target, uint32_t expected)
+{
+	uint32_t n = __atomic_fetch_add(&slip_count, 1u, __ATOMIC_RELAXED) %
+		SLIP_LOG_MAX;
+	uint32_t ahead = pcm_ahead_by(target, expected);
+
+	slip_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
+	slip_delta[n] = ahead ? (int32_t)ahead :
+		-(int32_t)pcm_ahead_by(expected, target);
+}
+#define COUNT_SLIP(target, expected) record_slip((target), (expected))
 /*
- * Separates a frozen pipe from a lapped consumer.  A resync says the cursor
- * fell behind; it does not say whether the transport stopped or the producer
- * ran away.  Counting completion gaps says which, and the two counts read
- * together are what a session line is for.
+ * Separates a frozen pipe from a producer that ran away.  A slip says the pin
+ * moved by the wrong amount; it does not say which side moved.  Counting
+ * completion gaps says which, and the two read together are what a session
+ * line is for.
  */
 static void track_freeze(void)
 {
@@ -420,7 +434,7 @@ static void track_freeze(void)
 #define COUNT_STARVE() ((void)0)
 #define COUNT_SUBMIT() ((void)0)
 #define COUNT_PCM_WAIT() ((void)0)
-#define COUNT_RESYNC(gap) ((void)0)
+#define COUNT_SLIP(target, expected) ((void)0)
 #define TRACK_FREEZE() ((void)0)
 #define RESET_FREEZE() ((void)0)
 #endif
@@ -818,90 +832,72 @@ static uint32_t pcm_back(uint32_t sequence)
 	return sequence == 1u ? UINT32_MAX : sequence - 1u;
 }
 
-static void pcm_resync(uint32_t latest)
+/*
+ * Re-derive the cursor from latest.  Called at slice boundaries only, because
+ * the two packets inside a slice have to come from the same slice.
+ *
+ * Contiguous playback means landing on the slice after the one just finished.
+ * Anything else is the producer and the USB frame timer having disagreed by a
+ * whole slice over the last two milliseconds: ahead means a slice was skipped,
+ * behind means one is about to be played twice.  Either is audible, both are
+ * bounded at 2 ms, and unlike a drifting cursor both are countable -- the pin
+ * turns a silent walk into a discrete event with a sign.
+ *
+ * Returns zero while capture has published nothing to pin to.
+ */
+static int pcm_pin(void)
 {
+	uint32_t latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
+	uint32_t target = latest;
 	uint32_t i;
 
-	cur.sequence = latest;
-	for (i = 0; i < PCM_RESYNC_TRAIL; ++i)
-		cur.sequence = pcm_back(cur.sequence);
-	cur.offset = 0;
-	cur.valid = latest != 0;
-}
-
-/* Forward distance on the 1..UINT32_MAX sequence ring; zero if not ahead. */
-static uint32_t pcm_ahead_by(uint32_t newer, uint32_t older)
-{
-	uint32_t distance = newer - older;
-
-	if ((int32_t)distance <= 0)
+	if (!cur.valid && latest <= PCM_TRAIL)
 		return 0;
-	return newer < older ? distance - 1u : distance;
+
+	for (i = 0; i < PCM_TRAIL; ++i)
+		target = pcm_back(target);
+	if (cur.valid) {
+		uint32_t expected = next_pcm_sequence(cur.sequence);
+
+		if (target != expected)
+			COUNT_SLIP(target, expected);
+	}
+	cur.sequence = target;
+	cur.valid = 1;
+	return 1;
 }
 
 /* Return zero for a packet, one when no packet is ready. */
 static int pcm_next(uint8_t packet[PACKET_BYTES])
 {
-	uint32_t latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
-	uint32_t gap;
-
 	/*
 	 * Priming.  uac1 has already selected the alternate setting, so the device
 	 * is live and expecting a packet every millisecond well before capture has
 	 * produced anything -- the tap still has to acquire the route, and enough
-	 * slices have to exist for the cursor to trail by PCM_RESYNC_TRAIL.  Send
-	 * silence across that window rather than nothing: a gap on an active
-	 * isochronous endpoint reads as an invalid stream to the device, while
-	 * continuous silence lets it lock cleanly and audio simply fades in.
-	 * This is also what keeps src.base from being read before audio_tap has
-	 * published it, since latest only leaves zero once a slice is complete.
+	 * slices have to exist to pin against.  Send silence across that window
+	 * rather than nothing: a gap on an active isochronous endpoint reads as an
+	 * invalid stream to the device, while continuous silence lets it lock
+	 * cleanly and audio simply fades in.  This is also what keeps src.base from
+	 * being read before audio_tap has published it, since latest only leaves
+	 * zero once a slice is complete.
 	 */
-	if (!cur.valid) {
-		if (latest <= PCM_RESYNC_TRAIL) {
-			memset(packet, 0, PACKET_BYTES);
-			return 0;
-		}
-		pcm_resync(latest);
+	if (cur.offset == 0u && !pcm_pin()) {
+		memset(packet, 0, PACKET_BYTES);
+		return 0;
 	}
 
-	gap = pcm_ahead_by(latest, cur.sequence);
-	if (gap > PCM_MAX_TRAIL) {
-		/* Lapped: Sony is overwriting the slice we were reading. */
-		COUNT_RESYNC(gap);
-		pcm_resync(latest);
-	} else if (gap < PCM_MIN_TRAIL) {
-		/*
-		 * Caught up.  The trail is a random walk between two clocks -- the
-		 * USB frame timer and Sony's -- and without this it has a fence
-		 * only at the top: drifting down to zero leaves the cursor reading
-		 * the slice being DMA'd, where guard[] is even so the copy
-		 * succeeds torn, gap is far under PCM_MAX_TRAIL so no resync
-		 * fires, and it cannot advance past latest.  An absorbing state,
-		 * and the reason a bad spot outlives everything but a replug.
-		 *
-		 * Not a resync: nothing has been lost, the slice simply is not
-		 * safely readable yet.  Waiting lets the producer pull ahead and
-		 * shows up as a pcm wait, which is what it is.
-		 */
+	/*
+	 * At a pinned trail the guard should always read complete, so a failure
+	 * here is not the ordinary contention the seqlock exists for -- it means
+	 * the pin is wrong.  Leave the cursor alone and let the next call retry;
+	 * the count is what says it happened.
+	 */
+	if (!pcm_copy(cur.sequence, cur.offset, packet))
 		return 1;
-	}
-
-	if (!pcm_copy(cur.sequence, cur.offset, packet)) {
-		latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
-		gap = pcm_ahead_by(latest, cur.sequence);
-		if (gap > PCM_MAX_TRAIL) {
-			COUNT_RESYNC(gap);
-			pcm_resync(latest);
-		}
-		if (!pcm_copy(cur.sequence, cur.offset, packet))
-			return 1;
-	}
 
 	cur.offset += PACKET_FRAMES;
-	if (cur.offset == UAC_STREAM_CAPTURE_FRAMES) {
-		cur.sequence = next_pcm_sequence(cur.sequence);
+	if (cur.offset == UAC_STREAM_CAPTURE_FRAMES)
 		cur.offset = 0;
-	}
 	return 0;
 }
 
@@ -957,13 +953,13 @@ static int queue_next_source_packet(void)
 #ifdef UAC_PSTV_ENABLE_LOGGING
 static void report_session(void)
 {
-	uint32_t total = __atomic_load_n(&resync_count, __ATOMIC_RELAXED);
-	uint32_t shown = total < RESYNC_LOG_MAX ? total : RESYNC_LOG_MAX;
+	uint32_t total = __atomic_load_n(&slip_count, __ATOMIC_RELAXED);
+	uint32_t shown = total < SLIP_LOG_MAX ? total : SLIP_LOG_MAX;
 	uint32_t first = total - shown;
 	uint32_t i;
 
 	uac_log(LOG_PREFIX
-		"session: %u packets, %u starved, %u pcm waits, %u resyncs, "
+		"session: %u packets, %u starved, %u pcm waits, %u slips, "
 		"%u freezes\n",
 		__atomic_load_n(&submit_count, __ATOMIC_RELAXED),
 		__atomic_load_n(&starve_count, __ATOMIC_RELAXED),
@@ -972,17 +968,16 @@ static void report_session(void)
 	/* Numbered by their real ordinal, so a run reads 331..338 rather than 1..8
 	 * and the packet numbers show how far apart they are firing. */
 	for (i = 0; i < shown; ++i) {
-		uint32_t k = (first + i) % RESYNC_LOG_MAX;
+		uint32_t k = (first + i) % SLIP_LOG_MAX;
 
-		uac_log(LOG_PREFIX
-			"  resync %u at packet %u, producer was %u slices ahead\n",
-			first + i + 1u, resync_at[k], resync_gap[k]);
+		uac_log(LOG_PREFIX "  slip %u at packet %u, pin moved %+d slices\n",
+			first + i + 1u, slip_at[k], slip_delta[k]);
 	}
 
 	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&starve_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&pcm_wait_count, 0u, __ATOMIC_RELAXED);
-	__atomic_store_n(&resync_count, 0u, __ATOMIC_RELAXED);
+	__atomic_store_n(&slip_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&freeze_count, 0u, __ATOMIC_RELAXED);
 }
 #define REPORT_SESSION() report_session()
