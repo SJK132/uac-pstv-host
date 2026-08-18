@@ -9,23 +9,27 @@
  * three scheduled 1 ms USB requests.  Must stay a whole number of USB packets
  * and fit one slice; see the assertions in stream.c.
  */
-#define UAC_STREAM_CAPTURE_FRAMES 96u
+#define UAC_STREAM_CAPTURE_FRAMES 144u
 #define UAC_STREAM_CAPTURE_BYTES (UAC_STREAM_CAPTURE_FRAMES * 4u)
 
 /*
  * Staging is AVConfig's own 0x1000 RAM-output region, cut into slices that
- * Sony's audio engine fills directly.  The region is fixed, so slice size and
- * count trade against each other, and the count is what buys stall tolerance:
- * three slices are always spoken for (see PCM_MAX_TRAIL), leaving COUNT - 3
- * block periods of slack.  Eight 96-frame slices give five, or 10 ms, and cut
- * latency to about 7 ms; four 240-frame slices gave one, which is not enough to
- * absorb the feeder being late by a single block.
+ * Sony's audio engine fills directly.  The region is fixed, so size and count
+ * trade against each other, and the count is what buys stall tolerance: three
+ * slices are always spoken for (see PCM_MAX_TRAIL), leaving COUNT - 3 block
+ * periods of slack.  Seven 144-frame slices pack 4032 of the 4096 bytes and
+ * give four, or 12 ms.
  *
- * The cost is the capture worker's wakeup rate, which is one per block.
+ * The cost of a smaller block is one more capture wakeup, and each of those
+ * preempts the feeder on its own core -- which matters more than the cycles,
+ * because the feeder is the thread carrying the 1 ms deadline.  333 Hz is where
+ * the slack this buys stops outrunning that.  Nothing here needs COUNT to be a
+ * power of two; slice indices are carried, never derived.
+ *
  * resolver.c checks the region against what these two say it needs.
  */
-#define UAC_STREAM_SLICE_BYTES 0x200u
-#define UAC_STREAM_SLICE_COUNT 8u
+#define UAC_STREAM_SLICE_BYTES 0x240u
+#define UAC_STREAM_SLICE_COUNT 7u
 
 int uac_stream_init(void);
 

@@ -41,7 +41,6 @@
 #define PACKET_FRAMES 48u
 #define PACKET_BYTES (PACKET_FRAMES * 4u)
 #define SONY_ISO_PACKET_SLOTS 8u
-#define PCM_SLICE_MASK (UAC_STREAM_SLICE_COUNT - 1u)
 /*
  * How far the cursor may trail the newest complete slice.
  *
@@ -132,9 +131,8 @@ STATIC_ASSERT(UAC_ERG != 0u && (UAC_ERG & (UAC_ERG - 1u)) == 0u,
 
 STATIC_ASSERT(UAC_STREAM_CAPTURE_BYTES <= UAC_STREAM_SLICE_BYTES,
 	capture_block_must_fit_one_slice);
-STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
-	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
-	slice_count_must_be_a_power_of_two_above_three);
+/* Below four, PCM_MAX_TRAIL leaves the cursor nowhere to stand. */
+STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u, slice_count_must_exceed_three);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
@@ -264,12 +262,21 @@ typedef struct {
  * sequence is the slice being filled, previous the one queued before it; both
  * belong to the capture worker.  Zero means "none", which is why sequence
  * numbers skip it.  base is written once per session, before any worker exists.
+ *
+ * index is the slot sequence occupies, carried rather than derived from it.
+ * That is what lets COUNT be seven: no modulo on any path, and no discontinuity
+ * when the sequence wraps, since the two are unrelated.  The reader cannot
+ * count its way to a slot after resyncing, so latest_index is published beside
+ * latest -- unsynchronised, because guard[] still carries the sequence and an
+ * inconsistent pair simply fails the check.
  */
 typedef struct {
 	void *base;
 	uint32_t latest;
+	uint32_t latest_index;
 	uint32_t sequence;
 	uint32_t previous;
+	uint32_t index;
 	uint32_t guard[UAC_STREAM_SLICE_COUNT];
 } __attribute__((aligned(UAC_ERG))) PcmSource;
 
@@ -284,6 +291,7 @@ typedef struct {
  */
 typedef struct {
 	uint32_t sequence;
+	uint32_t index;
 	uint32_t offset;
 	uint32_t write_sequence;
 	int valid;
@@ -414,10 +422,19 @@ static uint32_t next_pcm_sequence(uint32_t sequence)
 	return sequence ? sequence : 1u;
 }
 
-static uint8_t *slice(uint32_t sequence)
+static uint32_t next_slice(uint32_t index)
 {
-	return (uint8_t *)src.base +
-		(sequence & PCM_SLICE_MASK) * UAC_STREAM_SLICE_BYTES;
+	return index + 1u == UAC_STREAM_SLICE_COUNT ? 0u : index + 1u;
+}
+
+static uint32_t prev_slice(uint32_t index)
+{
+	return index == 0u ? UAC_STREAM_SLICE_COUNT - 1u : index - 1u;
+}
+
+static uint8_t *slice(uint32_t index)
+{
+	return (uint8_t *)src.base + index * UAC_STREAM_SLICE_BYTES;
 }
 
 void uac_stream_capture_region(void *base)
@@ -428,30 +445,37 @@ void uac_stream_capture_region(void *base)
 void *uac_stream_capture_claim(void)
 {
 	uint32_t sequence = next_pcm_sequence(src.sequence);
+	uint32_t index = next_slice(src.index);
 
 	src.previous = src.sequence;
 	src.sequence = sequence;
+	src.index = index;
 	/*
 	 * Odd marks the slice in flight, and the fence keeps that visible before
 	 * Sony's engine starts writing behind it.  A relaxed store plus a release
 	 * fence is one dmb; a seq_cst store would be dmb-str-dmb and buy nothing,
 	 * there being a single producer.  This is the write_seqlock() half.
 	 */
-	__atomic_store_n(&src.guard[sequence & PCM_SLICE_MASK],
-		(sequence << 1) | 1u, __ATOMIC_RELAXED);
+	__atomic_store_n(&src.guard[index], (sequence << 1) | 1u,
+		__ATOMIC_RELAXED);
 	__atomic_thread_fence(__ATOMIC_RELEASE);
-	return slice(sequence);
+	return slice(index);
 }
 
 void uac_stream_capture_ready(void)
 {
 	uint32_t sequence = src.previous;
+	uint32_t index;
 
 	/* The first submit of a session has nothing queued behind it. */
 	if (sequence == 0u)
 		return;
-	__atomic_store_n(&src.guard[sequence & PCM_SLICE_MASK], sequence << 1,
-		__ATOMIC_RELEASE);
+	index = prev_slice(src.index);
+	__atomic_store_n(&src.guard[index], sequence << 1, __ATOMIC_RELEASE);
+	/* Index first: a reader that acquires latest then sees a newer index has
+	 * an inconsistent pair, which guard[] rejects.  The reverse could hand it
+	 * a stale slot that passes. */
+	__atomic_store_n(&src.latest_index, index, __ATOMIC_RELAXED);
 	__atomic_store_n(&src.latest, sequence, __ATOMIC_RELEASE);
 	signal_pcm();
 }
@@ -738,16 +762,16 @@ static int wait_for_free_context(StreamContext **out)
 	}
 }
 
-static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
+static int pcm_copy(uint8_t *packet)
 {
-	uint32_t *guard = &src.guard[sequence & PCM_SLICE_MASK];
-	uint32_t expected = sequence << 1;
+	uint32_t *guard = &src.guard[cur.index];
+	uint32_t expected = cur.sequence << 1;
 	uint32_t attempt;
 
 	for (attempt = 0; attempt < 3u; ++attempt) {
 		if (__atomic_load_n(guard, __ATOMIC_ACQUIRE) != expected)
 			continue;
-		memcpy(packet, slice(sequence) + offset * 4u, PACKET_BYTES);
+		memcpy(packet, slice(cur.index) + cur.offset * 4u, PACKET_BYTES);
 		/*
 		 * Fence first, then a relaxed read -- not an acquire load.
 		 * Acquire orders what comes after it; what has to be ordered
@@ -765,10 +789,15 @@ static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
 	return 0;
 }
 
+/* Land one slice behind the newest complete one, which is the design point:
+ * closer has no room to fall behind, further spends slack for nothing. */
 static void pcm_resync(uint32_t latest)
 {
+	uint32_t index = __atomic_load_n(&src.latest_index, __ATOMIC_ACQUIRE);
+
 	/* Sequence 1 is startup when invalid, and follows UINT32_MAX at wrap. */
 	cur.sequence = latest == 1u ? (cur.valid ? UINT32_MAX : 1u) : latest - 1u;
+	cur.index = prev_slice(index);
 	cur.offset = 0;
 	cur.valid = latest != 0;
 }
@@ -815,20 +844,21 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 		pcm_resync(latest);
 	}
 
-	if (!pcm_copy(cur.sequence, cur.offset, packet)) {
+	if (!pcm_copy(packet)) {
 		latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
 		gap = pcm_ahead_by(latest, cur.sequence);
 		if (gap > PCM_MAX_TRAIL) {
 			COUNT_RESYNC(gap);
 			pcm_resync(latest);
 		}
-		if (!pcm_copy(cur.sequence, cur.offset, packet))
+		if (!pcm_copy(packet))
 			return 1;
 	}
 
 	cur.offset += PACKET_FRAMES;
 	if (cur.offset == UAC_STREAM_CAPTURE_FRAMES) {
 		cur.sequence = next_pcm_sequence(cur.sequence);
+		cur.index = next_slice(cur.index);
 		cur.offset = 0;
 	}
 	return 0;
@@ -1006,7 +1036,9 @@ int uac_stream_start(int pipe_id)
 	memset(&src, 0, sizeof(src));
 	for (index = 0; index < UAC_STREAM_SLICE_COUNT; ++index)
 		src.guard[index] = 1u;
+	src.index = UAC_STREAM_SLICE_COUNT - 1u;	/* first claim rotates to 0 */
 	cur.sequence = 0;
+	cur.index = 0;
 	cur.offset = 0;
 	cur.valid = 0;
 
