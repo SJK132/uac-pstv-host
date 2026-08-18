@@ -9,9 +9,8 @@
  * teardown has to prove it is still the session it started on.
  */
 
-/* Session-thread failures, distinct from the negative SCE error codes. */
+/* Session-thread failure, distinct from the negative SCE error codes. */
 #define SESSION_ERROR_CONTROL_TIMEOUT -0x7f000001
-#define SESSION_ERROR_BUSY -0x7f000002
 
 /* Init before USB registration; shutdown only after the driver is unregistered. */
 int session_init(void);

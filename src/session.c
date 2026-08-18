@@ -60,7 +60,6 @@ static struct {
 	int control_pipe;
 	int stream_pipe;
 	int interface_selected;
-	int detached;
 	Uac1Stream stream;
 } live = {
 	.device_id = -1,
@@ -212,8 +211,6 @@ static void close_session(void)
 	int result;
 
 	(void)result; /* uac_log may compile out. */
-	if (detached)
-		live.detached = 1;
 	if (live.device_id < 0 && live.control_pipe < 0 && live.stream_pipe < 0)
 		return;
 
@@ -243,7 +240,7 @@ static void close_session(void)
 	 * source never falling back to internal.  Pointless once the device is
 	 * physically gone, hence the detach check.
 	 */
-	if (live.interface_selected && !live.detached)
+	if (live.interface_selected && !detached)
 		(void)set_interface(live.stream.interface_number, 0, "select alt 0");
 	if (live.control_pipe >= 0) {
 		result = ksceUsbdClosePipe(live.control_pipe);
@@ -252,7 +249,6 @@ static void close_session(void)
 	}
 
 	live.interface_selected = 0;
-	live.detached = 0;
 	__atomic_store_n(&live.device_id, -1, __ATOMIC_RELEASE);
 }
 
@@ -281,26 +277,19 @@ static void open_session(int device_id)
 
 	live.stream = stream;
 	live.interface_selected = 0;
-	live.detached = 0;
 	__atomic_store_n(&live.device_id, device_id, __ATOMIC_RELEASE);
 
 	live.control_pipe = ksceUsbdOpenPipe(device_id, NULL);
 	uac_log(LOG_PREFIX "control pipe open: 0x%08x\n", live.control_pipe);
-	if (live.control_pipe < 0)
-		goto fail;
-	if (cancelled())
+	if (live.control_pipe < 0 || cancelled())
 		goto fail;
 
 	live.stream_pipe = ksceUsbdOpenPipe(device_id, live.stream.endpoint);
 	uac_log(LOG_PREFIX "stream pipe open: 0x%08x\n", live.stream_pipe);
-	if (live.stream_pipe < 0)
-		goto fail;
-	if (cancelled())
+	if (live.stream_pipe < 0 || cancelled())
 		goto fail;
 
-	if (set_configuration(live.stream.configuration) < 0)
-		goto fail;
-	if (cancelled())
+	if (set_configuration(live.stream.configuration) < 0 || cancelled())
 		goto fail;
 
 	if (set_interface(live.stream.interface_number,
@@ -312,9 +301,7 @@ static void open_session(int device_id)
 	if (cancelled())
 		goto fail;
 
-	if (live.stream.frequency_control && set_sample_rate() < 0)
-		goto fail;
-	if (cancelled())
+	if ((live.stream.frequency_control && set_sample_rate() < 0) || cancelled())
 		goto fail;
 
 	result = uac_stream_start(live.stream_pipe);
@@ -515,10 +502,8 @@ int session_shutdown(void)
 		if (result < 0)
 			return result;
 		session_thread = -1;
-	} else {
-		/* No worker ever ran; unwind anything init left behind. */
-		close_session();
 	}
+	/* Nothing can be open without a worker: open_session only runs on one. */
 	if (live.device_id >= 0 || live.control_pipe >= 0 || live.stream_pipe >= 0)
 		return -1;
 

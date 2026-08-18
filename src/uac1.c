@@ -34,9 +34,7 @@
 #define UAC_EP_GENERAL 1u
 #define UAC_VERSION_1_0 0x0100u
 
-/* UAC1 endpoint sampling-frequency control. */
-#define UAC_SET_CUR 1u
-#define UAC_EP_SAMPLING_FREQ 0x0100u
+/* UAC1 endpoint sampling-frequency control bit, in bmaControls[0]. */
 #define UAC_EP_FREQ_CONTROL 0x01u
 
 /* Fixed descriptor sizes from USB 2.0, table 9-8 through table 9-13. */
@@ -210,14 +208,12 @@ static uint16_t endpoint_capacity(uint16_t raw, uint8_t speed)
 	return payload * (transactions + 1u);
 }
 
-static uint16_t stream_packet_bytes(uint8_t speed, uint8_t interval)
+/* stream.c queues one 192-byte request per millisecond, so the endpoint has to
+ * be serviced exactly that often. */
+static int services_one_packet_per_ms(uint8_t speed, uint8_t interval)
 {
-	/* stream.c queues one 192-byte request per millisecond. */
-	if ((speed == SCE_USBD_DEVICE_SPEED_FS && interval == 1) ||
-	    (speed == SCE_USBD_DEVICE_SPEED_HS && interval == 4))
-		return TARGET_PACKET_BYTES;
-
-	return 0;
+	return (speed == SCE_USBD_DEVICE_SPEED_FS && interval == 1) ||
+	       (speed == SCE_USBD_DEVICE_SPEED_HS && interval == 4);
 }
 
 static int uac1_header_valid(const uint8_t *header, const void *parent_end)
@@ -326,7 +322,6 @@ static int build_stream_candidate(const DeviceScan *scan,
 	SceUsbdEndpointDescriptor *next_ep;
 	uint8_t sync_type;
 	uint16_t capacity;
-	uint16_t packet_bytes;
 
 	if ((endpoint->bEndpointAddress & 0x0fu) == 0 ||
 	    (endpoint->bEndpointAddress & 0x70u) != 0 ||
@@ -352,15 +347,14 @@ static int build_stream_candidate(const DeviceScan *scan,
 		return 0;
 	}
 
-	packet_bytes = stream_packet_bytes(scan->speed, endpoint->bInterval);
-	if (packet_bytes == 0) {
+	if (!services_one_packet_per_ms(scan->speed, endpoint->bInterval)) {
 		uac_log(LOG_PREFIX "reject ep 0x%02x: speed %u interval %u\n",
 			endpoint->bEndpointAddress, scan->speed, endpoint->bInterval);
 		return 0;
 	}
-	if (packet_bytes > capacity) {
+	if (capacity < TARGET_PACKET_BYTES) {
 		uac_log(LOG_PREFIX "reject ep 0x%02x: needs %u bytes, max %u\n",
-			endpoint->bEndpointAddress, packet_bytes, capacity);
+			endpoint->bEndpointAddress, TARGET_PACKET_BYTES, capacity);
 		return 0;
 	}
 
@@ -510,14 +504,8 @@ int uac1_probe(int device_id)
 	return SCE_USBD_PROBE_SUCCEEDED;
 }
 
-/*
- * Claim the device and hand it to the session thread.
- *
- * SUCCEEDED means "this driver owns the device", not "the stream is up".  The
- * old code returned the same way -- it answered once SET_CONFIGURATION had been
- * submitted, long before setup finished -- so the contract is unchanged; it is
- * only more obvious now.
- */
+/* SUCCEEDED means "this driver owns the device", not "the stream is up": setup
+ * runs afterwards on the session thread. */
 int uac1_attach(int device_id)
 {
 	TRACE_CALLBACK(attach_count, "attach callback #%u: device %d\n", device_id);

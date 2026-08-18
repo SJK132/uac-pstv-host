@@ -456,7 +456,7 @@ static int cleanup(void)
  *
  * Unwinding is fail-closed.  While the route is still ours, AVConfig may enter
  * either wrapper and a later retry still needs the resolved state, so hooks and
- * layout remain installed.  audio_tap_shutdown() retries that cleanup.
+ * layout remain installed.  A later audio_tap_end() retries that cleanup.
  */
 int audio_tap_begin(void)
 {
