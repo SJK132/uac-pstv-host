@@ -89,10 +89,11 @@ be unplugged before starting a new Bluetooth-audio session.
 
 A few details that matter if you go reading the source:
 
-- **Latency** is about 9 ms: 2 ms to fill a capture slice, about 4 ms because
-  the consumer trails the producer by two slices, plus 3 ms submitted to USB.
-  It trails by two rather than one because `ram_submit` returning proves only
-  that Sony took the previous buffer, not that its DMA has finished with it.
+- **Latency** is about 11 ms: 2 ms to fill a capture slice, about 6 ms because
+  the consumer trails the producer by three slices, plus 3 ms submitted to USB.
+  It sits in the middle of the readable window rather than at its edge, and no
+  closer than two because `ram_submit` returning proves only that Sony took the
+  previous buffer, not that its DMA has finished with it.
 - **Staging is latest-wins, not a queue.** The capture worker isn't
   rate-locked to 48 kHz — it publishes whatever `ram_submit` returns, whenever it
   returns — so a FIFO underneath it thrashes. The seqlock lets the reader snap to

@@ -49,18 +49,26 @@
  */
 #define PCM_MAX_TRAIL (UAC_STREAM_SLICE_COUNT - 3u)
 /*
- * Where a resync lands, in slices behind the newest complete one.
+ * How close to latest the cursor may ever sit.
  *
- * Two, not one, because "complete" is optimistic: ram_submit() returns once the
- * previous buffer has left Sony's one-deep mailbox, and the mailbox is cleared
- * while the DMA descriptor is being programmed rather than when the transfer
- * finishes.  A cursor at latest - 1 can therefore be reading a slice still
- * being written, with guard[] saying it is safe -- continuous torn samples,
- * audible as distortion, and dependent on phase rather than on anything in our
- * state, which is why cycling the CPU clock clears it.  The second slice buys a
- * whole block period of separation for 2 ms of latency.
+ * "Complete" is optimistic: ram_submit() returns once the previous buffer has
+ * left Sony's one-deep mailbox, and the mailbox is cleared while the DMA
+ * descriptor is being programmed rather than when the transfer finishes.  A
+ * cursor at latest - 1 can be reading a slice still being written with guard[]
+ * saying it is safe, which tears silently -- pcm_copy succeeds, no counter
+ * moves, and it is audible only as distortion.
  */
-#define PCM_RESYNC_TRAIL 2u
+#define PCM_MIN_TRAIL 2u
+/*
+ * Where a resync lands: the middle of the readable window, not either edge.
+ *
+ * Landing at a fixed distance from one edge is what lets a bad phase persist.
+ * Drift carries the cursor toward whichever edge it started nearest, and every
+ * resync drops it back at the same place, so it re-enters the same collision
+ * within a few slices.  Centring gives drift in either direction the same room,
+ * and costs one slice of latency over sitting at PCM_MIN_TRAIL.
+ */
+#define PCM_RESYNC_TRAIL ((PCM_MIN_TRAIL + PCM_MAX_TRAIL) / 2u)
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -149,9 +157,9 @@ STATIC_ASSERT(UAC_STREAM_SLICE_BYTES >=
 STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
 	slice_count_must_be_a_power_of_two_above_three);
-/* A resync has to land inside the readable window, with room left to drift. */
-STATIC_ASSERT(PCM_RESYNC_TRAIL >= 1u && PCM_RESYNC_TRAIL < PCM_MAX_TRAIL,
-	resync_must_land_inside_the_trail);
+/* Room on both sides: clear of the DMA below, clear of being lapped above. */
+STATIC_ASSERT(PCM_RESYNC_TRAIL >= PCM_MIN_TRAIL &&
+	PCM_RESYNC_TRAIL < PCM_MAX_TRAIL, resync_must_land_inside_the_window);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
