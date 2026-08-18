@@ -19,7 +19,6 @@ void uac_stream_source_failed(int result);
 int uac_stream_start(int pipe_id);
 void uac_stream_stop(void);
 void uac_stream_pipe_closed(int pipe_id);
-int uac_stream_is_active(void);
 int uac_stream_shutdown(void);
 
 #endif
