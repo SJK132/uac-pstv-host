@@ -4,12 +4,12 @@
  * Sony's audio path normally hands decoded PCM to the HDMI transport.  For the
  * duration of one USB session this file takes that route over: it hooks
  * AVConfig's DataSend start, acknowledges its physical-stop wrapper locally,
- * flips the route word to RAM output, and runs a stand-in worker that passes
- * each captured page to stream.c instead.
+ * flips the route word to RAM output, and runs a stand-in worker that drives
+ * Sony's RAM output into stream.c's staging slices.
  *
  * The whole file lives between audio_tap_begin() and audio_tap_end().  Route
- * acquisition is polled so the feeder can keep USB alive with startup silence;
- * release may block on the capture worker and AVConfig state convergence.
+ * acquisition blocks the session thread while the feeder covers it with
+ * silence; release blocks on the capture worker and AVConfig convergence.
  */
 
 #include "audio_tap.h"
@@ -19,7 +19,6 @@
 #include "stream.h"
 
 #include <stdint.h>
-#include <string.h>
 
 #include <psp2kern/kernel/threadmgr.h>
 #include <taihen.h>
@@ -34,9 +33,6 @@
 #define CAPTURE_RATE 48000
 #define CAPTURE_CHANNELS 2
 #define CAPTURE_FRAMES UAC_STREAM_CAPTURE_FRAMES
-#define CAPTURE_BYTES UAC_STREAM_CAPTURE_BYTES
-_Static_assert(CAPTURE_FRAMES <= 512u,
-	"capture block exceeds Sony's 0x800-byte RAM-output page");
 /*
  * Copied from Sony's own DataSend worker, which this thread stands in for: it
  * feeds the same RAM-output pages, so it needs the same scheduling treatment.
@@ -107,8 +103,6 @@ static int physical_stop(void *state)
 
 static int capture_worker(SceSize args, void *argp)
 {
-	void *previous = audio.page[0];
-	void *next = audio.page[1];
 	int result;
 
 	(void)args;
@@ -122,19 +116,16 @@ static int capture_worker(SceSize args, void *argp)
 		result = audio.ram_channels(CAPTURE_CHANNELS);
 	while (result >= 0 &&
 	       !__atomic_load_n(&stop_requested, __ATOMIC_ACQUIRE)) {
-		void *swap;
-
-		result = audio.ram_submit(CAPTURE_TARGET, next, CAPTURE_FRAMES);
+		/*
+		 * ram_submit() queues one buffer and returns when the previously
+		 * queued one has been consumed, so the slice claimed last time is
+		 * complete exactly here.
+		 */
+		result = audio.ram_submit(CAPTURE_TARGET,
+			uac_stream_capture_claim(), CAPTURE_FRAMES);
 		if (result < 0)
 			break;
-		(void)uac_stream_publish(previous);
-		swap = previous;
-		previous = next;
-		next = swap;
-	}
-	if (result >= 0) {
-		(void)audio.ram_rate(CAPTURE_RATE);
-		(void)audio.ram_channels(CAPTURE_CHANNELS);
+		uac_stream_capture_ready();
 	}
 	__atomic_store_n(&worker_result, result, __ATOMIC_RELEASE);
 	if (result < 0 &&
@@ -176,7 +167,6 @@ static int start_capture(uint32_t mac0, uint32_t mac1, uint32_t flags)
 	}
 	__atomic_store_n(&worker_result, 0, __ATOMIC_RELEASE);
 
-	memset(audio.page[0], 0, CAPTURE_BYTES);
 	thread = ksceKernelCreateThread("uac_audio_tap", capture_worker,
 		CAPTURE_PRIORITY, CAPTURE_STACK, 0, CAPTURE_CPU_MASK, NULL);
 	if (thread < 0) {
@@ -386,6 +376,8 @@ static int begin_route(void)
 #endif
 	__atomic_store_n(&worker_result, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&stop_requested, 1, __ATOMIC_RELEASE);
+	/* Before any start hook can fire, and so before the feeder can read it. */
+	uac_stream_capture_region(audio.capture_base);
 	*audio.route_word |= ROUTE_RAM;
 	*audio.transport_ready = 1u;
 	*audio.route_dirty = 1u;

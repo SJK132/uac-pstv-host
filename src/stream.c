@@ -3,22 +3,22 @@
  *
  * Two halves that meet in the middle:
  *
- *   - the source side, driven by audio_tap's capture worker, publishes whole
- *     captured blocks into a small seqlock (uac_stream_publish);
- *   - the transport side runs one feeder thread that cuts those blocks into
+ *   - the source side is Sony's own audio engine, writing captured PCM into
+ *     four slices of AVConfig's RAM-output region;
+ *   - the transport side runs one feeder thread that cuts those slices into
  *     48-frame (1 ms) packets and keeps three isochronous requests in flight,
  *     with one context staged behind them.
  *
- * The seqlock is latest-wins, and deliberately not a FIFO.  Producer and
- * consumer run off unrelated clocks -- Sony's audio hardware and the USB host's
- * frame timer -- so they are never rate-matched, and USB completions have been
+ * Staging is latest-wins, and deliberately not a FIFO.  Producer and consumer
+ * run off unrelated clocks -- Sony's audio hardware and the USB host's frame
+ * timer -- so they are never rate-matched, and USB completions have been
  * measured stalling for 250 ms at a stretch.  Latest-wins throws the backlog
  * away and resumes at current audio for the price of one discontinuity; a FIFO
  * would add that 250 ms to output latency permanently, again on each stall.
  *
- * session.c owns the lifecycle: uac_stream_start(), uac_stream_stop() and
- * uac_stream_pipe_closed() are called from the session thread and nowhere else,
- * so the feeder has exactly one creator and one reaper.
+ * session.c owns this file's lifecycle: uac_stream_start(), uac_stream_stop()
+ * and uac_stream_pipe_closed() are called from the session thread and nowhere
+ * else, so the feeder has exactly one creator and one reaper.
  */
 
 #include "stream.h"
@@ -41,15 +41,14 @@
 #define PACKET_FRAMES 48u
 #define PACKET_BYTES (PACKET_FRAMES * 4u)
 #define SONY_ISO_PACKET_SLOTS 8u
+#define PCM_SLICE_MASK (UAC_STREAM_SLICE_COUNT - 1u)
 /*
- * Staging depth, in whole captured blocks.  This is history, not queue: the
- * producer overwrites the oldest slot unconditionally every block and never
- * waits.  Depth therefore buys stall tolerance -- how far the feeder can fall
- * behind before pcm_resync() has to jump forward, which is audible -- and costs
- * no latency, since latency is fixed by where resync places the cursor.
+ * One slice is always being filled, so the cursor may trail the newest
+ * complete slice by at most two before the one under it is the one Sony is
+ * overwriting.  This was already the true limit when staging was a private
+ * copy; it was just masked by the copy finishing in microseconds.
  */
-#define PCM_SLOT_COUNT 4u
-#define PCM_SLOT_MASK (PCM_SLOT_COUNT - 1u)
+#define PCM_MAX_TRAIL (UAC_STREAM_SLICE_COUNT - 2u)
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -89,9 +88,8 @@
  * blocks again, so it cannot monopolise a core.
  *
  * The affinity is a cache decision rather than a scheduling one: pinned to the
- * capture worker's core (CAPTURE_CPU_MASK in audio_tap.c), a freshly published
- * block is still in L1 when the feeder reads it back out.  On separate cores a
- * 960-byte block is thirty line invalidations, six thousand a second.
+ * capture worker's core (CAPTURE_CPU_MASK in audio_tap.c), a slice Sony has
+ * just filled is still in L1 when the feeder reads it out.
  */
 #define FEEDER_PRIORITY 0x20
 #define FEEDER_CPU_MASK 0x80000u
@@ -124,9 +122,14 @@ STATIC_ASSERT(UAC_ERG != 0u && (UAC_ERG & (UAC_ERG - 1u)) == 0u,
 #error Native blocks must contain a whole number of USB packets
 #endif
 
-#if UAC_STREAM_CAPTURE_BYTES > 0x800u
-#error Native blocks must fit the Sony RAM-output page
-#endif
+STATIC_ASSERT(UAC_STREAM_CAPTURE_BYTES <= UAC_STREAM_SLICE_BYTES,
+	capture_block_must_fit_one_slice);
+STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 2u &&
+	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
+	slice_count_must_be_a_power_of_two_above_two);
+/* Keeps every slice line-aligned, not just the first. */
+STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
+	slice_stride_must_tile_lines);
 
 enum {
 	STREAM_IDLE = 0,
@@ -191,34 +194,8 @@ STATIC_ASSERT(sizeof(StreamContext) == CONTEXT_ALIGN,
 STATIC_ASSERT(PACKET_BYTES <= CONTEXT_ALIGN, context_buffer_must_fit_one_block);
 STATIC_ASSERT(4096u % CONTEXT_ALIGN == 0u, context_blocks_must_tile_a_page);
 
-/*
- * One captured block, plus the seqlock words that publish it.  guard sits next
- * to the data it guards rather than in a separate array, so validating a read
- * touches the same lines as the read.  The 64 is two lines rather than one and
- * only tidies the slot size; correctness needs no more than UAC_ERG.
- */
-typedef struct {
-	uint32_t guard;
-	uint32_t sequence;
-	int16_t pcm[UAC_STREAM_CAPTURE_FRAMES * 2u]
-		__attribute__((aligned(64)));
-} PcmSlot;
-
-/*
- * Stride keeps every slot on a line, not just the first; offset keeps each
- * slot's PCM on one.  Both hold for any block size that is a whole number of
- * packets, which is the real constraint but is not visible at the point where
- * someone would change UAC_STREAM_CAPTURE_FRAMES.
- */
-STATIC_ASSERT(sizeof(PcmSlot) % UAC_ERG == 0u, pcm_slot_stride_must_tile_lines);
-STATIC_ASSERT(offsetof(PcmSlot, pcm) % UAC_ERG == 0u,
-	pcm_slot_payload_must_start_on_a_line);
-STATIC_ASSERT(PCM_SLOT_COUNT != 0u && (PCM_SLOT_COUNT & PCM_SLOT_MASK) == 0u,
-	pcm_slot_count_must_be_power_of_two);
-
 static StreamContext contexts[CONTEXT_COUNT]
 	__attribute__((aligned(CONTEXT_ALIGN)));
-static PcmSlot pcm_slots[PCM_SLOT_COUNT] __attribute__((aligned(UAC_ERG)));
 
 /*
  * Shared state, grouped by who touches it and padded to own its granule.
@@ -261,13 +238,31 @@ typedef struct {
 } __attribute__((aligned(UAC_ERG))) CallbackLifetime;
 
 /*
- * Producer to consumer.  Both live on CAPTURE_CPU_MASK, so this group carries
- * no cross-core traffic; it is grouped to stay out of TxPump's granule.
+ * Capture slices.
+ *
+ * AVConfig's two RAM-output pages are contiguous -- page A at data+0x400 and
+ * page B at data+0xC00, each 0x800 -- so the pair is one 0x1000 region ending
+ * four bytes short of send_worker_active.  ram_submit() takes its buffer per
+ * call and validates only the frame count, so the two-page ping-pong is Sony's
+ * convention rather than their API's: we rotate four 0x400 slices through it
+ * instead, and their engine writes the staging buffer directly.  That is one
+ * 960-byte copy per 5 ms of audio that no longer happens.
+ *
+ * The payload is Sony's memory; the publication protocol is ours.  guard[] is
+ * odd while a slice is in flight and even once the following submit has proved
+ * it complete -- the same seqlock as before, with their DMA on the writing side
+ * in place of our memcpy.
+ *
+ * sequence is the slice being filled, previous the one queued before it; both
+ * belong to the capture worker.  Zero means "none", which is why sequence
+ * numbers skip it.  base is written once per session, before any worker exists.
  */
 typedef struct {
-	int enabled;
-	int producer_busy;
+	void *base;
 	uint32_t latest;
+	uint32_t sequence;
+	uint32_t previous;
+	uint32_t guard[UAC_STREAM_SLICE_COUNT];
 } __attribute__((aligned(UAC_ERG))) PcmSource;
 
 /*
@@ -331,9 +326,9 @@ static SceUID feeder_thread = -1;
  *            unfilled, so the isochronous stream gets a hole.  Audible.
  *   pcm wait the feeder had a context but no PCM to put in it.  Absorbed by the
  *            staged contexts; not audible by itself.
- *   resync   the producer lapped the block being read and the cursor jumped to
+ *   resync   the producer lapped the slice being read and the cursor jumped to
  *            current audio.  Audible, and the one that matters most.  Its gap
- *            says what caused it: four or five blocks is ordinary jitter, fifty
+ *            says what caused it: two or three slices is ordinary jitter, fifty
  *            is one of the 250 ms whole-pipe USB stalls.
  *
  * These swing by orders of magnitude between runs of the same binary, so read
@@ -409,40 +404,46 @@ static uint32_t next_pcm_sequence(uint32_t sequence)
 	return sequence ? sequence : 1u;
 }
 
-static void pcm_write(const void *pcm)
+static uint8_t *slice(uint32_t sequence)
 {
-	PcmSlot *slot;
-	uint32_t sequence = next_pcm_sequence(
-		__atomic_load_n(&src.latest, __ATOMIC_RELAXED));
-
-	slot = &pcm_slots[sequence & PCM_SLOT_MASK];
-	/*
-	 * Mark the slot odd, then fence.  All this needs is for the marker to be
-	 * visible before the data writes that follow, which is a release fence
-	 * after a relaxed store: one dmb.  A seq_cst store would compile to
-	 * dmb-str-dmb and buy nothing -- there is a single producer, so there is
-	 * no second writer for total order to arbitrate between.  This is the
-	 * write_seqlock() half.
-	 */
-	__atomic_store_n(&slot->guard, (sequence << 1) | 1u, __ATOMIC_RELAXED);
-	__atomic_thread_fence(__ATOMIC_RELEASE);
-	memcpy(slot->pcm, pcm, UAC_STREAM_CAPTURE_BYTES);
-	__atomic_store_n(&slot->sequence, sequence, __ATOMIC_RELAXED);
-	__atomic_store_n(&slot->guard, sequence << 1, __ATOMIC_RELEASE);
-	__atomic_store_n(&src.latest, sequence, __ATOMIC_RELEASE);
-	signal_pcm();
+	return (uint8_t *)src.base +
+		(sequence & PCM_SLICE_MASK) * UAC_STREAM_SLICE_BYTES;
 }
 
-int uac_stream_publish(const void *pcm)
+void uac_stream_capture_region(void *base)
 {
-	if (pcm == NULL || !__atomic_load_n(&src.enabled, __ATOMIC_ACQUIRE))
-		return 0;
-	if (__atomic_exchange_n(&src.producer_busy, 1, __ATOMIC_ACQUIRE))
-		return 0;
-	if (__atomic_load_n(&src.enabled, __ATOMIC_ACQUIRE))
-		pcm_write(pcm);
-	__atomic_store_n(&src.producer_busy, 0, __ATOMIC_RELEASE);
-	return 1;
+	__atomic_store_n(&src.base, base, __ATOMIC_RELEASE);
+}
+
+void *uac_stream_capture_claim(void)
+{
+	uint32_t sequence = next_pcm_sequence(src.sequence);
+
+	src.previous = src.sequence;
+	src.sequence = sequence;
+	/*
+	 * Odd marks the slice in flight, and the fence keeps that visible before
+	 * Sony's engine starts writing behind it.  A relaxed store plus a release
+	 * fence is one dmb; a seq_cst store would be dmb-str-dmb and buy nothing,
+	 * there being a single producer.  This is the write_seqlock() half.
+	 */
+	__atomic_store_n(&src.guard[sequence & PCM_SLICE_MASK],
+		(sequence << 1) | 1u, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	return slice(sequence);
+}
+
+void uac_stream_capture_ready(void)
+{
+	uint32_t sequence = src.previous;
+
+	/* The first submit of a session has nothing queued behind it. */
+	if (sequence == 0u)
+		return;
+	__atomic_store_n(&src.guard[sequence & PCM_SLICE_MASK], sequence << 1,
+		__ATOMIC_RELEASE);
+	__atomic_store_n(&src.latest, sequence, __ATOMIC_RELEASE);
+	signal_pcm();
 }
 
 static void finish_retire(void)
@@ -727,43 +728,16 @@ static int wait_for_free_context(StreamContext **out)
 	}
 }
 
-static void pcm_begin(void)
-{
-	__atomic_store_n(&src.enabled, 0, __ATOMIC_RELEASE);
-	while (__atomic_load_n(&src.producer_busy, __ATOMIC_ACQUIRE))
-		ksceKernelDelayThread(50);
-
-	memset(pcm_slots, 0, sizeof(pcm_slots));
-	__atomic_store_n(&src.latest, 0, __ATOMIC_RELAXED);
-	cur.sequence = 0;
-	cur.offset = 0;
-	cur.valid = 0;
-	reset_event(pcm_event);
-	__atomic_store_n(&src.enabled, 1, __ATOMIC_RELEASE);
-}
-
-static void pcm_end(void)
-{
-	__atomic_store_n(&src.enabled, 0, __ATOMIC_RELEASE);
-	signal_pcm();
-	while (__atomic_load_n(&src.producer_busy, __ATOMIC_ACQUIRE))
-		ksceKernelDelayThread(50);
-}
-
 static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
 {
-	PcmSlot *slot = &pcm_slots[sequence & PCM_SLOT_MASK];
+	uint32_t *guard = &src.guard[sequence & PCM_SLICE_MASK];
 	uint32_t expected = sequence << 1;
-	uint32_t before;
 	uint32_t attempt;
 
 	for (attempt = 0; attempt < 3u; ++attempt) {
-		before = __atomic_load_n(&slot->guard, __ATOMIC_ACQUIRE);
-		if (before != expected ||
-		    __atomic_load_n(&slot->sequence, __ATOMIC_RELAXED) != sequence)
+		if (__atomic_load_n(guard, __ATOMIC_ACQUIRE) != expected)
 			continue;
-		memcpy(packet, (const uint8_t *)slot->pcm + offset * 4u,
-			PACKET_BYTES);
+		memcpy(packet, slice(sequence) + offset * 4u, PACKET_BYTES);
 		/*
 		 * Fence first, then a relaxed read -- not an acquire load.
 		 * Acquire orders what comes after it; what has to be ordered
@@ -775,7 +749,7 @@ static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
 		 * the read_seqretry() half of the pattern.
 		 */
 		__atomic_thread_fence(__ATOMIC_ACQUIRE);
-		if (__atomic_load_n(&slot->guard, __ATOMIC_RELAXED) == before)
+		if (__atomic_load_n(guard, __ATOMIC_RELAXED) == expected)
 			return 1;
 	}
 	return 0;
@@ -809,12 +783,12 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	 * Priming.  uac1 has already selected the alternate setting, so the device
 	 * is live and expecting a packet every millisecond well before capture has
 	 * produced anything -- the tap still has to acquire the route, and two
-	 * blocks have to exist before the consumer can trail the producer.  Send
+	 * slices have to exist before the consumer can trail the producer.  Send
 	 * silence across that window rather than nothing: a gap on an active
 	 * isochronous endpoint reads as an invalid stream to the device, while
 	 * continuous silence lets it lock cleanly and audio simply fades in.
-	 * Only ever taken before the first real block; a mid-stream stall still
-	 * falls through to the wait below.
+	 * This is also what keeps src.base from being read before audio_tap has
+	 * published it, since latest only leaves zero once a slice is complete.
 	 */
 	if (!cur.valid) {
 		if (latest < 2u) {
@@ -825,8 +799,8 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	}
 
 	gap = pcm_ahead_by(latest, cur.sequence);
-	if (gap >= PCM_SLOT_COUNT) {
-		/* Lapped: the block being read got overwritten. Audible jump. */
+	if (gap > PCM_MAX_TRAIL) {
+		/* Lapped: Sony is overwriting the slice we were reading. */
 		COUNT_RESYNC(gap);
 		pcm_resync(latest);
 	}
@@ -834,7 +808,7 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	if (!pcm_copy(cur.sequence, cur.offset, packet)) {
 		latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
 		gap = pcm_ahead_by(latest, cur.sequence);
-		if (gap >= PCM_SLOT_COUNT) {
+		if (gap > PCM_MAX_TRAIL) {
 			COUNT_RESYNC(gap);
 			pcm_resync(latest);
 		}
@@ -855,8 +829,6 @@ static void pcm_wait(void)
 	uint32_t matched;
 	int result;
 
-	if (!__atomic_load_n(&src.enabled, __ATOMIC_ACQUIRE))
-		return;
 	result = ksceKernelWaitEventFlag(pcm_event, PCM_EVENT_BIT,
 		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &matched, NULL);
 	if (result < 0)
@@ -918,7 +890,7 @@ static void report_session(void)
 		__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED), total);
 	for (i = 0; i < shown; ++i)
 		uac_log(LOG_PREFIX
-			"  resync %u at packet %u, producer was %u blocks ahead\n",
+			"  resync %u at packet %u, producer was %u slices ahead\n",
 			i + 1u, resync_at[i], resync_gap[i]);
 
 	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
@@ -941,7 +913,6 @@ static int usb_feeder_thread(SceSize args, void *argp)
 	 * whole of AVConfig's ~400 ms convergence rather than seeing a gap; PCM
 	 * simply starts arriving partway through, and pcm_next() switches to it.
 	 */
-	pcm_begin();
 	while (stream_running()) {
 		/*
 		 * A context with no PCM to put in it.  If this tracks the starve
@@ -953,7 +924,6 @@ static int usb_feeder_thread(SceSize args, void *argp)
 			pcm_wait();
 		}
 	}
-	pcm_end();
 	REPORT_SESSION();
 	return 0;
 }
@@ -1017,6 +987,19 @@ int uac_stream_start(int pipe_id)
 	__atomic_store_n(&tx.primed, 0, __ATOMIC_RELEASE);
 	memset(contexts, 0, sizeof(contexts));
 
+	/*
+	 * The source is reset here rather than on the feeder, so it is ordered
+	 * before audio_tap_begin() by the session thread itself.  Guards start
+	 * odd, which is what makes an untouched slice unreadable rather than
+	 * looking like a complete sequence zero.
+	 */
+	memset(&src, 0, sizeof(src));
+	for (index = 0; index < UAC_STREAM_SLICE_COUNT; ++index)
+		src.guard[index] = 1u;
+	cur.sequence = 0;
+	cur.offset = 0;
+	cur.valid = 0;
+
 	for (index = 0; index < CONTEXT_COUNT; ++index) {
 		StreamContext *context = &contexts[index];
 
@@ -1027,6 +1010,7 @@ int uac_stream_start(int pipe_id)
 	}
 
 	reset_event(free_event);
+	reset_event(pcm_event);
 	publish_free_context();
 
 	thread = ksceKernelCreateThread("uac_usb_feeder", usb_feeder_thread,
@@ -1132,7 +1116,6 @@ int uac_stream_shutdown(void)
 	if (__atomic_load_n(&feeder_thread, __ATOMIC_ACQUIRE) >= 0 ||
 	    __atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) != STREAM_IDLE)
 		return -1;
-	pcm_end();
 	if (pcm_event >= 0) {
 		result = ksceKernelDeleteEventFlag(pcm_event);
 		if (result < 0)

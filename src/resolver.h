@@ -24,7 +24,7 @@ typedef struct {
 	volatile uint32_t *send_worker_active;
 	volatile uint32_t *recv_worker_active;
 	void *route_lock;
-	void *page[2];
+	void *capture_base;
 	AudioCpuLockFn cpu_lock;
 	AudioCpuUnlockFn cpu_unlock;
 	AudioRouteWakeFn route_wake;

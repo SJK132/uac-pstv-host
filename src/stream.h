@@ -6,14 +6,32 @@
  * feeder starts one whole block behind the newest, because blocks arrive in
  * discrete steps while the USB side drains continuously, so anything less runs
  * dry between arrivals.  Latency is therefore about two block periods plus the
- * three scheduled 1 ms USB requests.  Must stay a whole number of USB packets;
- * see the assertions in stream.c.
+ * three scheduled 1 ms USB requests.  Must stay a whole number of USB packets
+ * and fit one slice; see the assertions in stream.c.
  */
 #define UAC_STREAM_CAPTURE_FRAMES 240u
 #define UAC_STREAM_CAPTURE_BYTES (UAC_STREAM_CAPTURE_FRAMES * 4u)
 
+/*
+ * Staging lives inside AVConfig's own RAM-output region, cut into four slices
+ * that Sony's audio engine fills directly.  See the capture note in stream.c;
+ * resolver.c checks the region against what these two say it needs.
+ */
+#define UAC_STREAM_SLICE_BYTES 0x400u
+#define UAC_STREAM_SLICE_COUNT 4u
+
 int uac_stream_init(void);
-int uac_stream_publish(const void *pcm);
+
+/*
+ * Capture rotation, driven by audio_tap's worker.  claim() marks the next
+ * slice in flight and returns the address to hand ram_submit(); ready() is
+ * called once that submit returns, which is what proves the slice before it is
+ * complete.
+ */
+void uac_stream_capture_region(void *base);
+void *uac_stream_capture_claim(void);
+void uac_stream_capture_ready(void);
+
 /* Report an asynchronous source failure without blocking its worker. */
 void uac_stream_source_failed(int result);
 int uac_stream_start(int pipe_id);
