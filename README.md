@@ -134,9 +134,9 @@ Verified by comparing decrypted modules: the two hooked function prologues, the
 are the same in all eleven. Retail and devkit ship the same module — a retail
 3.65 console reports `0x55A6E312`, matching the 3.65 devkit dump.
 
-The three `SceAudio` RAM-output functions are module exports. They are
-resolved from the module's export table by NID at runtime; no SceAudio text
-offset is assumed.
+The three `SceAudio` RAM-output functions are pinned by text offset on the same
+evidence, and checked against their first instruction before use. SceAudio is
+byte-identical across the same eleven firmware.
 
 The NID list is enforced, not just documentation: a module NID outside it is
 refused and no hooks are installed. Firmware outside this verified list loses
@@ -148,7 +148,8 @@ Two gates run, in order:
 1. **Module NID** — identifies the exact build, and must be one of the eleven.
 2. **Small sanity check** — each hook entry must still contain the recorded
    instruction and the `movw`/`movt` pair must decode for the expected register.
-   The three SceAudio function NIDs must resolve to Thumb entry points.
+   The three SceAudio entry points must each begin with their recorded
+   instruction.
 
 The second gate is deliberately thin, because the NID has already pinned the
 firmware. It checks the two hook entries and the instruction pair used to derive
