@@ -24,19 +24,13 @@
 #define LOG_PREFIX "[uac-pstv-resolver] "
 
 /*
- * SceAudio's three RAM-output functions, by fixed text offset.
+ * SceAudio's three RAM-output functions, by fixed text offset -- same evidence
+ * as the AVConfig offsets below, and the same NID gate covers both.
  *
- * On the same evidence as the AVConfig offsets: every SceAudio across 3.60 to
- * 3.73 differs from 3.65 in five bytes -- its module NID and one version digit
- * -- so one offset set covers the range.  The AVConfig NID gate has already
- * refused anything outside it before this runs, so a second allowlist would add
- * nothing.
- *
- * SCEAUDIO_EXPORTS_OFFSET is the one value here that was inferred rather than
- * read out: SceAudio's module NID sits 0x28 ahead of its first export
- * descriptor, exactly as AVConfig's does.  The prologue halfwords are what make
- * that inference safe -- a wrong text base fails the comparison and resolution
- * is refused, instead of three calls into whatever happens to be there.
+ * SCEAUDIO_EXPORTS_OFFSET was inferred, not read out: SceAudio's module NID
+ * sits 0x28 ahead of its first export descriptor, as AVConfig's does.  The
+ * prologue halfwords are what keep that safe -- a wrong text base fails the
+ * comparison and resolution is refused rather than called into.
  */
 #define SCEAUDIO_EXPORTS_OFFSET 0x768Cu
 #define RAM_RATE_OFFSET 0x2E80u
@@ -130,7 +124,6 @@ static uintptr_t decode_data_base(uintptr_t movw, uintptr_t movt, unsigned int r
 	return ((uintptr_t)half[1] << 16) | half[0];
 }
 
-
 static int resolve_audio(AudioLayout *layout)
 {
 	tai_module_info_t module = {0};
@@ -170,9 +163,6 @@ int resolver_open(AudioLayout *layout)
 	layout->module_id = -1;
 	module.size = sizeof(module);
 	if (taiGetModuleInfoForKernel(KERNEL_PID, "SceAVConfig", &module) < 0)
-		return -1;
-	if (module.modid < 0 || module.exports_start == 0u ||
-	    module.exports_start >= module.exports_end)
 		return -1;
 	firmware = known_firmware(module.module_nid);
 	if (firmware == NULL) {
@@ -231,7 +221,7 @@ int resolver_open(AudioLayout *layout)
 #undef DATA_U32
 
 	if (resolve_audio(layout) < 0) {
-		uac_log(LOG_PREFIX "SceAudio RAM exports unavailable\n");
+		uac_log(LOG_PREFIX "SceAudio RAM functions failed validation\n");
 		resolver_close(layout);
 		return -1;
 	}
