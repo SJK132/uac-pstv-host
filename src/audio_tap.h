@@ -8,10 +8,11 @@
  */
 int audio_tap_begin(void);
 
-/* End one USB session. Resolution and private hooks exist only between these. */
+/*
+ * End one USB session; resolution and private hooks exist only between these.
+ * Fail-closed and idempotent, so module_stop calls it again to retry a cleanup
+ * an interrupted session left behind.
+ */
 int audio_tap_end(void);
-
-/* Module shutdown: retry cleanup after an interrupted USB session. */
-int audio_tap_shutdown(void);
 
 #endif

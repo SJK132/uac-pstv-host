@@ -38,30 +38,24 @@
 _Static_assert(CAPTURE_FRAMES <= 512u,
 	"capture block exceeds Sony's 0x800-byte RAM-output page");
 /*
- * Priority and affinity are copied from Sony's own DataSend worker, which this
- * thread stands in for -- it feeds the same RAM-output pages, so it needs the
- * same scheduling treatment.  0x12 is high, and deliberately so; do not lower it
- * without measuring for dropouts first.  Note that shrinking CAPTURE_FRAMES
- * raises this thread's wakeup rate proportionally, which is the cost side of
- * buying lower latency that way.
+ * Copied from Sony's own DataSend worker, which this thread stands in for: it
+ * feeds the same RAM-output pages, so it needs the same scheduling treatment.
+ * 0x12 is high deliberately; do not lower it without measuring for dropouts.
+ * Shrinking CAPTURE_FRAMES raises this thread's wakeup rate proportionally.
  */
 #define CAPTURE_PRIORITY 0x12
 #define CAPTURE_STACK 0x2000u
 #define CAPTURE_CPU_MASK 0x80000u
 #define WORKER_TIMEOUT_US 1000000u
 
-/*
- * Distinct codes rather than a bare -1: this is the subsystem most likely to
- * fail in the field and the hardest to reason about from a log, and
- * "0xffffffff" tells you only that some stage failed.
- */
+/* Distinct codes rather than a bare -1: this is the subsystem most likely to
+ * fail in the field, and "0xffffffff" says only that some stage did. */
 #define UAC_TAP_ROUTE_BUSY ((int)0x80A10001)
 #define UAC_TAP_ROUTE_WAKE_FAILED ((int)0x80A10002)
 #define UAC_TAP_ACQUIRE_TIMEOUT ((int)0x80A10003)
 #define UAC_TAP_RELEASE_TIMEOUT ((int)0x80A10004)
 #define UAC_TAP_WORKER_START_TIMEOUT ((int)0x80A10005)
 #define UAC_TAP_WORKER_BAD_STATE ((int)0x80A10006)
-#define UAC_TAP_WORKER_NO_THREAD ((int)0x80A10007)
 #define UAC_TAP_START_REFUSED ((int)0x80A10008)
 #define UAC_TAP_HOOK_RELEASE_FAILED ((int)0x80A10009)
 
@@ -87,8 +81,10 @@ static volatile int worker_result;
 #ifdef UAC_PSTV_ENABLE_LOGGING
 static volatile uint32_t physical_stop_count;
 /*
- * Sony's entries into our start hook, per session.  If this is always 1 the
- * accept_start guard below is dead code; above 1 it is load-bearing.
+ * Sony's entries into our start hook, per session.  Acquisition accounts for
+ * one.  A second means AVConfig re-entered send_start during teardown, which is
+ * the case the accept_start handshake in start_capture() exists for; if it is
+ * always 1, that handshake reduces to the worker_state CAS beside it.
  */
 static volatile uint32_t send_start_count;
 #endif
@@ -113,20 +109,13 @@ static int capture_worker(SceSize args, void *argp)
 {
 	void *previous = audio.page[0];
 	void *next = audio.page[1];
-	int expected = WORKER_STARTING;
 	int result;
 
 	(void)args;
 	(void)argp;
-	if (!__atomic_compare_exchange_n(&worker_state, &expected,
-		WORKER_RUNNING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-		result = UAC_TAP_WORKER_BAD_STATE;
-		__atomic_store_n(&worker_result, result, __ATOMIC_RELEASE);
-		if (!__atomic_load_n(&stop_requested, __ATOMIC_ACQUIRE))
-			uac_stream_source_failed(result);
-		__atomic_store_n(&worker_state, WORKER_EXITED, __ATOMIC_RELEASE);
-		return result;
-	}
+	/* STARTING is ours until we leave it: start_capture() took it with a CAS
+	 * and stop_capture() waits rather than writing over it. */
+	__atomic_store_n(&worker_state, WORKER_RUNNING, __ATOMIC_RELEASE);
 
 	result = audio.ram_rate(CAPTURE_RATE);
 	if (result >= 0)
@@ -233,14 +222,10 @@ static int stop_capture(void)
 				return result;
 			__atomic_store_n(&worker_thread, -1, __ATOMIC_RELEASE);
 		}
-		__atomic_store_n(&worker_state, WORKER_IDLE, __ATOMIC_RELEASE);
 		*audio.send_worker_active = 0u;
 		return 0;
 	}
-	if (state != WORKER_RUNNING && state != WORKER_EXITED)
-		return UAC_TAP_WORKER_BAD_STATE;
-	if (thread < 0)
-		return UAC_TAP_WORKER_NO_THREAD;
+	/* RUNNING or EXITED, so the worker ran and its UID was set before it did. */
 	result = ksceKernelWaitThreadEnd(thread, &status, &timeout);
 	if (result < 0)
 		return result;
@@ -323,6 +308,12 @@ static RouteState route_state(void)
 	return ROUTE_MOVING;
 }
 
+static int worker_present(void)
+{
+	return __atomic_load_n(&worker_state, __ATOMIC_ACQUIRE) != WORKER_IDLE ||
+	       __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0;
+}
+
 static int release_route(void)
 {
 	uint32_t token;
@@ -381,8 +372,7 @@ static int begin_route(void)
 {
 	uint32_t token;
 
-	if (__atomic_load_n(&worker_state, __ATOMIC_ACQUIRE) != WORKER_IDLE ||
-	    __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0)
+	if (worker_present())
 		return UAC_TAP_WORKER_BAD_STATE;
 	token = audio.cpu_lock(audio.route_lock);
 	/* recv_worker_active is an acquire-time conflict only; see route_state(). */
@@ -407,14 +397,13 @@ static int begin_route(void)
 }
 
 /*
- * Wait for AVConfig to converge on our route.
+ * Wait for AVConfig to converge on our route.  Blocking is safe here: the
+ * caller is the session thread, which has no deadline, and the feeder is
+ * already running and covering the ~400 ms with silence.
  *
- * Blocking, as it was before v1.0.1 split it into a poll.  That split existed
- * because the caller was the USB feeder, which has a 1 ms deadline and had to
- * keep sending silence while it waited.  The caller is now the session thread,
- * which has no deadline, and the feeder is already running and priming by the
- * time this starts -- so the wait is nobody's problem.
- *
+ * WORKER_RUNNING is what proves the capture side is up -- start_capture()
+ * reaches it only after creating and starting the thread -- and ROUTE_OURS
+ * covers the five route words including send_worker_active.
  */
 static int await_route(void)
 {
@@ -426,30 +415,20 @@ static int await_route(void)
 
 		if (result < 0)
 			return result;
-		if (route_state() == ROUTE_OURS &&
-		    *audio.recv_worker_active == 0u && state == WORKER_RUNNING &&
-		    __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0 &&
-		    __atomic_load_n(&accept_start, __ATOMIC_ACQUIRE) != 0 &&
-		    __atomic_load_n(&stop_requested, __ATOMIC_ACQUIRE) == 0) {
+		if (route_state() == ROUTE_OURS && state == WORKER_RUNNING &&
+		    *audio.recv_worker_active == 0u) {
 			uac_log(LOG_PREFIX "native %u-frame A/B capture active\n",
 				(unsigned int)CAPTURE_FRAMES);
 			return 0;
 		}
-		if (state == WORKER_EXITED ||
-		    (state != WORKER_IDLE && state != WORKER_STARTING &&
-		     state != WORKER_RUNNING))
+		/* Exited with a non-negative result: stopped, not failed. */
+		if (state == WORKER_EXITED)
 			return UAC_TAP_WORKER_BAD_STATE;
 		if ((uint32_t)(ksceKernelGetSystemTimeLow() - start) >
 		    ROUTE_TIMEOUT_US)
 			return UAC_TAP_ACQUIRE_TIMEOUT;
 		ksceKernelDelayThread(ROUTE_POLL_US);
 	}
-}
-
-static int worker_present(void)
-{
-	return __atomic_load_n(&worker_state, __ATOMIC_ACQUIRE) != WORKER_IDLE ||
-	       __atomic_load_n(&worker_thread, __ATOMIC_ACQUIRE) >= 0;
 }
 
 static int cleanup(void)
@@ -513,11 +492,6 @@ int audio_tap_begin(void)
 }
 
 int audio_tap_end(void)
-{
-	return cleanup();
-}
-
-int audio_tap_shutdown(void)
 {
 	return cleanup();
 }

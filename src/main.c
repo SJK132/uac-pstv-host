@@ -133,7 +133,7 @@ static int fail_start(void)
 		safe = 0;
 	if (safe && uac_stream_shutdown() < 0)
 		safe = 0;
-	if (safe && audio_tap_shutdown() < 0)
+	if (safe && audio_tap_end() < 0)
 		safe = 0;
 	if (!safe) {
 		uac_log(LOG_PREFIX "start rollback incomplete; staying resident\n");
@@ -242,7 +242,7 @@ int module_stop(SceSize args, const void *argp)
 	stream_result = uac_stream_shutdown();
 	if (stream_result < 0)
 		return SCE_KERNEL_STOP_FAIL;
-	tap_result = audio_tap_shutdown();
+	tap_result = audio_tap_end();
 	if (tap_result < 0)
 		return SCE_KERNEL_STOP_FAIL;
 	uac_log_close();
