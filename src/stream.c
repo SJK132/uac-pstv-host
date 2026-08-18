@@ -42,18 +42,9 @@
 #define PACKET_BYTES (PACKET_FRAMES * 4u)
 #define SONY_ISO_PACKET_SLOTS 8u
 /*
- * How far the cursor may trail the newest complete slice.
- *
- * Three slices are spoken for, not one.  ram_submit()'s mailbox holds the slice
- * claimed this iteration while Sony is still filling the one claimed last
- * iteration, so two are unreadable at any instant; the third is latest itself,
- * which trail counts from.  Claiming happens before the following publish
- * advances latest, so the oldest readable slice goes odd while latest still
- * names the older value -- which is why this is COUNT - 3 and not COUNT - 2.
- *
- * A private staging copy did not pay this: its write window was a memcpy, so
- * only one slot was ever briefly unreadable.  Slices are held for a whole block
- * period instead, and the depth has to cover it.
+ * Two slices are unreadable at any instant -- ram_submit()'s mailbox holds one
+ * queued while Sony fills another -- and the third is latest itself, which
+ * trail counts from.  Hence COUNT - 3, not COUNT - 2.
  */
 #define PCM_MAX_TRAIL (UAC_STREAM_SLICE_COUNT - 3u)
 /*
@@ -206,20 +197,14 @@ static StreamContext contexts[CONTEXT_COUNT]
 /*
  * Shared state, grouped by who touches it and padded to own its granule.
  *
- * Aligning the variables alone is not enough: alignment fixes where an object
+ * Aligning the variables alone is not enough: that fixes where an object
  * starts, not how much it occupies, so GCC stays free to pack the next scalar
- * into the tail.  Aligning the type makes sizeof a multiple of that alignment,
- * which is what actually reserves the granule.
+ * into the tail.  Aligning the type is what reserves the granule.
  *
- * The attribute has to sit before the typedef name, as written below.  Putting
- * it after -- "} TxPump __attribute__((aligned(32)))" -- reads the same and
- * applies to the declarator instead, giving alignof 32 while leaving sizeof at
- * 24, which is the exact hole this is meant to close.
- *
- * These words were once laid out by declaration order and happened to group
- * correctly, until an unrelated change shifted GCC's anchor grouping and
- * dropped the per-millisecond PCM cursor in beside in_flight and pump_requests.
- * New shared state goes inside one of these, not at file scope.
+ * The attribute must sit before the typedef name, as written below.  After it
+ * -- "} TxPump __attribute__((aligned(32)))" -- applies to the declarator,
+ * giving alignof 32 while leaving sizeof 24, which is the exact hole this
+ * closes.  New shared state goes inside one of these, not at file scope.
  */
 
 /* Read or updated by both the feeder and the USBD callback on every packet. */
@@ -244,30 +229,18 @@ typedef struct {
 } __attribute__((aligned(UAC_ERG))) CallbackLifetime;
 
 /*
- * Capture slices.
+ * Capture slices.  AVConfig's two RAM-output pages are contiguous -- 0x400 and
+ * 0xC00, 0x800 each -- and ram_submit() takes its buffer per call, validating
+ * only the frame count.  The two-page ping-pong is Sony's convention, not their
+ * API's, so we rotate our own slices through that one region and their engine
+ * writes the staging buffer directly.
  *
- * AVConfig's two RAM-output pages are contiguous -- page A at data+0x400 and
- * page B at data+0xC00, each 0x800 -- so the pair is one 0x1000 region ending
- * four bytes short of send_worker_active.  ram_submit() takes its buffer per
- * call and validates only the frame count, so the two-page ping-pong is Sony's
- * convention rather than their API's: we rotate four 0x400 slices through it
- * instead, and their engine writes the staging buffer directly.  That is one
- * 960-byte copy per 5 ms of audio that no longer happens.
- *
- * The payload is Sony's memory; the publication protocol is ours.  guard[] is
- * odd while a slice is in flight and even once the following submit has proved
- * it complete -- the same seqlock as before, with their DMA on the writing side
- * in place of our memcpy.
- *
- * sequence is the slice being filled, previous the one queued before it; both
- * belong to the capture worker.  Zero means "none", which is why sequence
- * numbers skip it.  base is written once per session, before any worker exists.
- *
- * index is the slot sequence occupies, carried rather than derived from it.
- * That is what lets COUNT be seven: no modulo on any path, and no discontinuity
- * when the sequence wraps, since the two are unrelated.  Nothing publishes it,
- * because guard[] already says which slot holds which sequence -- see
- * pcm_resync(), which is the only reader that has to ask.
+ * The payload is Sony's; the publication protocol is ours.  guard[] is odd
+ * while a slice is in flight, even once the following submit proves it
+ * complete.  sequence and previous are the slices being filled and queued
+ * behind it; zero means none, which is why sequence numbers skip it.  index is
+ * carried rather than derived, so COUNT need not be a power of two and the
+ * sequence wrap needs no special case.
  */
 typedef struct {
 	void *base;
@@ -690,18 +663,13 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
 
 	__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
 	/*
-	 * RELEASE rather than ACQ_REL, and the difference is one dmb per
-	 * completion.  ARM maps an acquire-release RMW to dmb-ldrex/strex-dmb,
-	 * so an ACQ_REL here followed by pump_ready()'s ACQ_REL ticket
-	 * increment emitted two barriers back to back with nothing but address
-	 * arithmetic between them -- the second one already orders everything
-	 * the first was there for.
-	 *
-	 * What the dropped acquire half would have ordered is the loads that
-	 * follow, and those all sit behind the ticket increment's own leading
-	 * barrier.  That makes this correct only because the next statement is
-	 * an acquire-release atomic: put a plain load between them and the
-	 * ordering is gone with nothing to warn you.
+	 * RELEASE, not ACQ_REL: one dmb per completion.  ARM maps an
+	 * acquire-release RMW to dmb-ldrex/strex-dmb, so ACQ_REL here plus
+	 * pump_ready()'s ACQ_REL ticket increment emitted two barriers back to
+	 * back.  The dropped acquire half would have ordered the loads that
+	 * follow, and those sit behind the ticket increment's own barrier -- so
+	 * this is correct only while the next statement is an acquire-release
+	 * atomic.  Put a plain load between them and the ordering is gone.
 	 */
 	__atomic_sub_fetch(&tx.in_flight, 1u, __ATOMIC_RELEASE);
 	/*
@@ -784,15 +752,10 @@ static int pcm_copy(uint8_t *packet)
 }
 
 /*
- * Land one slice behind the newest complete one, which is the design point:
- * closer has no room to fall behind, further spends slack for nothing.
- *
- * The slot comes from guard[], the only thing that actually knows which slice
- * holds which sequence.  Asking it costs a scan of seven words on a path taken
- * a handful of times per session, and saves publishing a second copy of the
- * mapping that could disagree with this one.  If the slice has already been
- * reclaimed, no guard matches, cur.index keeps its old value and pcm_copy fails
- * -- the same outcome as any other stale read, and the caller retries.
+ * Land one slice behind the newest complete one.  The slot comes from guard[],
+ * which is the only thing that knows which slice holds which sequence; if it
+ * has already been reclaimed nothing matches, cur.index is left alone and
+ * pcm_copy fails, same as any other stale read.
  */
 static void pcm_resync(uint32_t latest)
 {
@@ -890,12 +853,9 @@ static void pcm_wait(void)
  * stream_running().
  *
  * Order matters: take USB-owned storage first, then sample the source.  The
- * reverse -- copy 1 ms of PCM, then wait for a free context -- reads as
- * equivalent and is not.  That wait is unbounded if a completion is delayed,
- * and the packet copied before it goes stale while we sit in it.  A completion
- * only makes transfer storage reusable; choosing what to put in that storage
- * belongs after ownership is held, so pcm_next() always resyncs against
- * whatever Sony has produced at submission time.
+ * reverse reads as equivalent and is not -- that wait is unbounded if a
+ * completion is delayed, and a packet copied before it goes stale while we sit
+ * in it.
  */
 static int queue_next_source_packet(void)
 {
