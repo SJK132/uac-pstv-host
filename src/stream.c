@@ -49,6 +49,19 @@
  */
 #define PCM_MAX_TRAIL (UAC_STREAM_SLICE_COUNT - 3u)
 /*
+ * Where a resync lands, in slices behind the newest complete one.
+ *
+ * Two, not one, because "complete" is optimistic: ram_submit() returns once the
+ * previous buffer has left Sony's one-deep mailbox, and the mailbox is cleared
+ * while the DMA descriptor is being programmed rather than when the transfer
+ * finishes.  A cursor at latest - 1 can therefore be reading a slice still
+ * being written, with guard[] saying it is safe -- continuous torn samples,
+ * audible as distortion, and dependent on phase rather than on anything in our
+ * state, which is why cycling the CPU clock clears it.  The second slice buys a
+ * whole block period of separation for 2 ms of latency.
+ */
+#define PCM_RESYNC_TRAIL 2u
+/*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
  * DMA-owned storage, while three queued frames keep SceUsbd's periodic cursor
@@ -136,6 +149,9 @@ STATIC_ASSERT(UAC_STREAM_SLICE_BYTES >=
 STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
 	slice_count_must_be_a_power_of_two_above_three);
+/* A resync has to land inside the readable window, with room left to drift. */
+STATIC_ASSERT(PCM_RESYNC_TRAIL >= 1u && PCM_RESYNC_TRAIL < PCM_MAX_TRAIL,
+	resync_must_land_inside_the_trail);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
@@ -749,10 +765,19 @@ static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
 	return 0;
 }
 
+/* Step back one on the 1..UINT32_MAX ring, which skips zero. */
+static uint32_t pcm_back(uint32_t sequence)
+{
+	return sequence == 1u ? UINT32_MAX : sequence - 1u;
+}
+
 static void pcm_resync(uint32_t latest)
 {
-	/* Sequence 1 is startup when invalid, and follows UINT32_MAX at wrap. */
-	cur.sequence = latest == 1u ? (cur.valid ? UINT32_MAX : 1u) : latest - 1u;
+	uint32_t i;
+
+	cur.sequence = latest;
+	for (i = 0; i < PCM_RESYNC_TRAIL; ++i)
+		cur.sequence = pcm_back(cur.sequence);
 	cur.offset = 0;
 	cur.valid = latest != 0;
 }
@@ -776,8 +801,8 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	/*
 	 * Priming.  uac1 has already selected the alternate setting, so the device
 	 * is live and expecting a packet every millisecond well before capture has
-	 * produced anything -- the tap still has to acquire the route, and two
-	 * slices have to exist before the consumer can trail the producer.  Send
+	 * produced anything -- the tap still has to acquire the route, and enough
+	 * slices have to exist for the cursor to trail by PCM_RESYNC_TRAIL.  Send
 	 * silence across that window rather than nothing: a gap on an active
 	 * isochronous endpoint reads as an invalid stream to the device, while
 	 * continuous silence lets it lock cleanly and audio simply fades in.
@@ -785,7 +810,7 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	 * published it, since latest only leaves zero once a slice is complete.
 	 */
 	if (!cur.valid) {
-		if (latest < 2u) {
+		if (latest <= PCM_RESYNC_TRAIL) {
 			memset(packet, 0, PACKET_BYTES);
 			return 0;
 		}
