@@ -45,22 +45,21 @@
 /*
  * How far behind latest the cursor is pinned, in slices.
  *
- * The cursor does not advance on its own.  It is re-derived from latest at
- * every slice boundary, so its distance from Sony's engine is a constant of the
- * design rather than the state of a random walk between two unrelated clocks.
+ * The reader follows the writer, strictly.  At every slice boundary the cursor
+ * is set to exactly this many slices behind latest -- no tolerance, no memory of
+ * where it used to be.  Whatever the transport did in the meantime is therefore
+ * irrelevant: a late completion, a stalled pump, a whole-pipe freeze, none of it
+ * can leave the reader behind, because the reader has no position of its own to
+ * fall behind with.  It is wherever the writer says it is.
  *
  * Two is the floor.  "Complete" is optimistic: ram_submit() returns once the
  * previous buffer has left Sony's one-deep mailbox, and the mailbox is cleared
  * while the DMA descriptor is being programmed rather than when the transfer
  * finishes, so latest - 1 can still be under the engine's pen with guard[]
- * saying otherwise.  COUNT - 3 is the ceiling: one slice is in flight, one is
- * latest, and one is the slot about to be reclaimed.
- *
- * Three sits in the middle, and because latest advances once per slice while
- * the cursor holds still, the real distance breathes between three and four --
- * never below the floor, never at the ceiling.
+ * saying otherwise.  Sitting at the floor means no margin above that reasoning:
+ * if "complete" is optimistic by one more slice than believed, it tears.
  */
-#define PCM_TRAIL 3u
+#define PCM_TRAIL 2u
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -150,9 +149,9 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
 	slice_count_must_be_a_power_of_two_above_three);
 /*
- * Room on both sides.  The pin sits at PCM_TRAIL and drifts one slice further
- * out before the next boundary pulls it back, so both ends of that breath have
- * to clear: the DMA below, being lapped above.
+ * Room on both sides for the whole excursion, not the pin alone: latest advances
+ * one slice mid-block while the cursor holds still, so the separation runs
+ * PCM_TRAIL to PCM_TRAIL + 1.  The DMA below, being lapped above.
  */
 STATIC_ASSERT(PCM_TRAIL >= 2u && PCM_TRAIL + 1u <= UAC_STREAM_SLICE_COUNT - 3u,
 	pinned_trail_must_clear_the_dma_and_the_lap);
@@ -345,12 +344,17 @@ static SceUID feeder_thread = -1;
  *
  *   starve   the transport won the right to submit and found the next context
  *            unfilled, so the isochronous stream gets a hole.  Audible.
- *   pcm wait the feeder had a context but no PCM to put in it.  With a pinned
- *            cursor this means pcm_copy() found the guard in flight, which the
- *            pin is supposed to make impossible.
- *   slip     the pin did not land on the slice after the one just played.
- *            Positive skipped a slice, negative will repeat one.  Audible, and
- *            the direct measure of the two clocks disagreeing.
+ *   pcm wait the feeder had a context but no PCM to put in it, meaning
+ *            pcm_copy() found the guard in flight or the slot reclaimed.  The
+ *            span says whether they are spread through the session or bunched
+ *            into one stretch, which is the difference between contention and
+ *            a cursor that stopped making progress.
+ *   slip     the writer had not advanced exactly one slice since the last
+ *            boundary, so following it strictly did not land on the next slice.
+ *            Positive skipped one, negative repeats one.  Audible.  A strict
+ *            follow reports the phase between the two clocks as well as any
+ *            real rate difference, so pairs of +1 and -1 a slice apart are
+ *            jitter cancelling out rather than drift.
  *   freeze   completions stopped arriving for long enough that the pipe, not
  *            the producer, is what went quiet.
  *
@@ -372,9 +376,25 @@ static uint32_t slip_count;
 static uint32_t freeze_count;
 static uint32_t slip_at[SLIP_LOG_MAX];
 static int32_t slip_delta[SLIP_LOG_MAX];
+static uint32_t wait_first;
+static uint32_t wait_last;
 #define COUNT_STARVE() __atomic_add_fetch(&starve_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_SUBMIT() __atomic_add_fetch(&submit_count, 1u, __ATOMIC_RELAXED)
-#define COUNT_PCM_WAIT() __atomic_add_fetch(&pcm_wait_count, 1u, __ATOMIC_RELAXED)
+
+/*
+ * Bracket the waits by packet number.  A count alone cannot tell fourteen
+ * thousand of them spread evenly across a session from fourteen thousand in one
+ * unbroken stretch at the end, and only the second means the cursor stopped.
+ */
+static void record_pcm_wait(void)
+{
+	uint32_t packet = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
+
+	if (__atomic_fetch_add(&pcm_wait_count, 1u, __ATOMIC_RELAXED) == 0u)
+		__atomic_store_n(&wait_first, packet, __ATOMIC_RELAXED);
+	__atomic_store_n(&wait_last, packet, __ATOMIC_RELAXED);
+}
+#define COUNT_PCM_WAIT() record_pcm_wait()
 
 /* Forward distance on the 1..UINT32_MAX sequence ring; zero if not ahead. */
 static uint32_t pcm_ahead_by(uint32_t newer, uint32_t older)
@@ -857,10 +877,10 @@ static int pcm_pin(void)
 	for (i = 0; i < PCM_TRAIL; ++i)
 		target = pcm_back(target);
 	if (cur.valid) {
-		uint32_t expected = next_pcm_sequence(cur.sequence);
+		uint32_t next = next_pcm_sequence(cur.sequence);
 
-		if (target != expected)
-			COUNT_SLIP(target, expected);
+		if (target != next)
+			COUNT_SLIP(target, next);
 	}
 	cur.sequence = target;
 	cur.valid = 1;
@@ -887,13 +907,17 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	}
 
 	/*
-	 * At a pinned trail the guard should always read complete, so a failure
-	 * here is not the ordinary contention the seqlock exists for -- it means
-	 * the pin is wrong.  Leave the cursor alone and let the next call retry;
-	 * the count is what says it happened.
+	 * Rewind to the slice boundary so the next call re-pins.  Retrying the
+	 * same slice cannot work: the guard only fails once the producer has
+	 * reclaimed the slot, and it will never hand that sequence back.  Holding
+	 * position at offset 48 is therefore permanent -- pcm_pin() runs only at a
+	 * boundary, so the cursor could never reach one again, and the stream goes
+	 * quiet for the rest of the session with nothing but pcm waits to show it.
 	 */
-	if (!pcm_copy(cur.sequence, cur.offset, packet))
+	if (!pcm_copy(cur.sequence, cur.offset, packet)) {
+		cur.offset = 0;
 		return 1;
+	}
 
 	cur.offset += PACKET_FRAMES;
 	if (cur.offset == UAC_STREAM_CAPTURE_FRAMES)
@@ -972,6 +996,24 @@ static void report_session(void)
 
 		uac_log(LOG_PREFIX "  slip %u at packet %u, pin moved %+d slices\n",
 			first + i + 1u, slip_at[k], slip_delta[k]);
+	}
+	if (__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED) != 0u)
+		uac_log(LOG_PREFIX "  pcm waits spanned packets %u..%u\n",
+			__atomic_load_n(&wait_first, __ATOMIC_RELAXED),
+			__atomic_load_n(&wait_last, __ATOMIC_RELAXED));
+	/*
+	 * The feeder has already left its loop, so the cursor is final.  A trail
+	 * that is not PCM_TRAIL here says the reader stopped following the writer,
+	 * and the offset says whether it stopped mid-slice.
+	 */
+	{
+		uint32_t latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
+
+		uac_log(LOG_PREFIX
+			"  final cursor: seq %u offset %u valid %d, latest %u, "
+			"trail %u\n",
+			cur.sequence, cur.offset, cur.valid, latest,
+			pcm_ahead_by(latest, cur.sequence));
 	}
 
 	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
