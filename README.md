@@ -51,11 +51,11 @@ build (below) and look for a `reject ep` line — it names the exact reason.
 
 ## Supported firmware
 
-Verified profiles are 3.60, 3.61, 3.63, 3.65, 3.67, 3.68, 3.71 and 3.73.
-PlayStation TV only; the plugin checks and unloads itself on a handheld Vita.
-Unverified firmware (currently 3.69, 3.70, 3.72 and 3.74) is rejected at USB
-attach without installing a hook. Each needs a real `SceAVConfig` module sample
-before it can be added safely.
+Verified profiles are 3.60, 3.61, 3.63, 3.65, 3.67, 3.68, 3.69, 3.70, 3.71, 3.72
+and 3.73. PlayStation TV only; the plugin checks and unloads itself on a handheld
+Vita. Unverified firmware (currently only 3.74) is rejected at USB attach without
+installing a hook. It needs a real `SceAVConfig` module sample before it can be
+added safely.
 
 
 ## How it works
@@ -123,12 +123,15 @@ fixed rather than per-firmware, and one binary covers the whole range.
 | 3.65 | `0x55A6E312` |
 | 3.67 | `0x1A5B797C` |
 | 3.68 | `0xA1F08F46` |
+| 3.69 | `0x4069C16D` |
+| 3.70 | `0x3F226D11` |
 | 3.71 | `0x5B294543` |
+| 3.72 | `0x0790F1A9` |
 | 3.73 | `0x136D0561` |
 
 Verified by comparing decrypted modules: the two hooked function prologues, the
 `movw`/`movt` pair that yields the private data base, and the data segment size
-are the same in all eight. Retail and devkit ship the same module — a retail
+are the same in all eleven. Retail and devkit ship the same module — a retail
 3.65 console reports `0x55A6E312`, matching the 3.65 devkit dump.
 
 The three `SceAudio` RAM-output functions are module exports. They are
@@ -142,7 +145,7 @@ of the system is untouched.
 
 Two gates run, in order:
 
-1. **Module NID** — identifies the exact build, and must be one of the eight.
+1. **Module NID** — identifies the exact build, and must be one of the eleven.
 2. **Small sanity check** — each hook entry must still contain the recorded
    instruction and the `movw`/`movt` pair must decode for the expected register.
    The three SceAudio function NIDs must resolve to Thumb entry points.
