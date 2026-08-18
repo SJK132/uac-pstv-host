@@ -52,19 +52,22 @@
  * can leave the reader behind, because the reader has no position of its own to
  * fall behind with.  It is wherever the writer says it is.
  *
- * One is the floor, and this sits on it.  ram_submit() returns once the previous
- * buffer has left Sony's one-deep mailbox, so publishing latest means the engine
- * has just taken that block -- latest is the slice under the pen, not a finished
- * one, and latest - 1 is the first block the engine can be argued to have let
- * go of.  Two slices behind the pen, exactly.
+ * One is the floor and it turned out to be too close.  ram_submit() returns once
+ * the previous buffer has left Sony's one-deep mailbox, so publishing latest
+ * means the engine has just taken that block; the argument that latest - 1 is
+ * therefore finished is sound and still produced continuous distortion, which is
+ * exactly what reading under the pen sounds like.  The mailbox says when a buffer
+ * was handed over, not when the engine stopped writing it, and those are not the
+ * same instant.
  *
- * There is no margin left above that argument.  If the engine ever holds a block
- * one longer than the mailbox implies, this reads it mid-write, and guard[] will
- * not say so: the slot was marked complete a block ago and is not reclaimed for
- * another seven, so the seqlock passes and every counter stays clean.  The only
- * symptom would be continuous distortion.
+ * So stand well back.  Four is five slices behind the block being written and
+ * one short of the ceiling, which leaves two block periods before Sony reclaims
+ * the slice under the cursor.  Eight milliseconds of trail against four of slack:
+ * the distortion this trades away is the one failure the design cannot report on
+ * itself, because a slice torn this way was marked complete a block ago, is not
+ * reclaimed for another seven, and passes the seqlock intact.
  */
-#define PCM_TRAIL 1u
+#define PCM_TRAIL 4u
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
