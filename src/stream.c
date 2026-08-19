@@ -43,30 +43,50 @@
 #define SONY_ISO_PACKET_SLOTS 8u
 #define PCM_SLICE_MASK (UAC_STREAM_SLICE_COUNT - 1u)
 /*
- * How far behind latest the cursor is pinned, in slices.
+ * The producer is the clock.
  *
- * The reader follows the writer, strictly.  At every slice boundary the cursor
- * is set to exactly this many slices behind latest -- no tolerance, no memory of
- * where it used to be.  Whatever the transport did in the meantime is therefore
- * irrelevant: a late completion, a stalled pump, a whole-pipe freeze, none of it
- * can leave the reader behind, because the reader has no position of its own to
- * fall behind with.  It is wherever the writer says it is.
+ * There is no cursor and no trail.  Sony completes one block every four
+ * milliseconds and is steadier at it than anything on this side, so the capture
+ * worker enqueues that block's packets as it finishes them and the transport
+ * drains the queue one per frame.  Nothing samples anything, so there is no
+ * phase to get wrong and no distance to tune.
  *
- * ram_submit() returns once the previous buffer has left Sony's one-deep
- * mailbox, so latest is a block the engine has finished rather than one it is
- * still writing.  Four and one both play clean, so the floor is at most one and
- * the distance is latency to spend rather than safety to buy: each slice is a
- * block period, 2 ms.  Zero reads the block just published, which is the
- * shortest the mailbox can be argued to allow and leaves nothing in hand if the
- * engine ever lingers past the handover.
+ * The device can follow.  uac1.c accepts only adaptive and synchronous
+ * endpoints, and an adaptive sink locks its clock to the rate it is fed, so
+ * sending exactly what Sony produces is not an approximation of rate matching --
+ * it is the thing itself.  A frame we cannot fill tells the device to slow down,
+ * which is the correct signal rather than a defect to conceal by repeating or
+ * dropping a block.
  *
- * Being too close is the one failure this design cannot report.  A slice torn
- * under the pen was marked complete before the cursor reached it and is not
- * reclaimed for another COUNT - 1, so the seqlock passes, every counter stays
- * clean, and the only symptom is continuous distortion.  Walk this down by ear,
- * not by argument.
+ * The depth cannot hold still.  A block arrives whole and leaves a packet at a
+ * time, so it swings by PACKETS_PER_BLOCK every period no matter what, and the
+ * only choice is where that swing sits.  FLOOR is the bottom of it and is the
+ * entire margin against the producer being late: at zero, a publication and a
+ * take land on the same instant every block and either order is a coin flip, so
+ * the trough is what has to be bought rather than the average.
+ *
+ * TARGET is the top, one block above the floor, so the queue averages exactly
+ * one block of trail -- the transport is sending block N while Sony writes N+1.
+ * It is both where draining begins and where an overrun is cut back to, so the
+ * queue lands on the same depth however it got there.  FLOOR is the only knob:
+ * every unit of it is a millisecond of latency bought with a millisecond of
+ * tolerance for the producer arriving late.
+ *
+ * MAX is not a preference.  An entry points into a slice, so it has to reach the
+ * wire before Sony reclaims that slice, and at enqueue the engine has already
+ * claimed the block after it -- leaving (COUNT - 1) block periods.  A packet
+ * spends that budget twice over, once waiting in the queue and again waiting in
+ * the schedule, so what is left for depth is the budget less the requests USBD
+ * already holds.  Exceed it and the controller reads a slice the engine has
+ * begun rewriting, which no counter here can see.
  */
-#define PCM_TRAIL 0u
+#define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
+#define PCM_QUEUE_SLOTS 16u
+#define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
+#define PCM_QUEUE_FLOOR 2u
+#define PCM_QUEUE_TARGET (PACKETS_PER_BLOCK + PCM_QUEUE_FLOOR)
+#define PCM_QUEUE_MAX \
+	((UAC_STREAM_SLICE_COUNT - 1u) * PACKETS_PER_BLOCK - MAX_IN_FLIGHT)
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -162,13 +182,17 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
 	slice_count_must_be_a_power_of_two_above_three);
 /*
- * Room on both sides.  Two slots are spoken for at any instant -- the one in
- * Sony's mailbox and the one claimed during the block period we hold the cursor
- * for -- so the cursor may not sit at COUNT - 1 or COUNT - 2 behind latest,
- * which is exactly COUNT - 3.  The mailbox sets the floor at one.
+ * The floor has to be a real margin, and the working peak has to sit below the
+ * cut with room to spare -- a TARGET close to MAX cuts on ordinary jitter, which
+ * is a slip manufactured out of nothing, the same mistake the sampled cursor
+ * made.  Half a block of headroom is the least that means anything.
  */
-STATIC_ASSERT(PCM_TRAIL <= UAC_STREAM_SLICE_COUNT - 3u,
-	pinned_trail_must_clear_the_lap);
+STATIC_ASSERT(PCM_QUEUE_FLOOR >= 1u, queue_floor_must_be_a_margin);
+STATIC_ASSERT(PCM_QUEUE_TARGET + PACKETS_PER_BLOCK / 2u <= PCM_QUEUE_MAX,
+	queue_target_must_leave_headroom_below_the_cut);
+STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_QUEUE_MAX &&
+	(PCM_QUEUE_SLOTS & PCM_QUEUE_MASK) == 0u,
+	queue_must_be_a_power_of_two_deeper_than_its_bound);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
@@ -311,11 +335,26 @@ typedef struct {
  */
 typedef struct {
 	void *base;
-	uint32_t latest;
 	uint32_t sequence;
 	uint32_t previous;
-	uint32_t guard[UAC_STREAM_SLICE_COUNT];
 } __attribute__((aligned(UAC_ERG))) PcmSource;
+
+/*
+ * The handoff.  One producer, the capture worker, appending whole blocks; one
+ * consumer, the feeder, taking a packet at a time.  head is the only shared
+ * word -- entries are pointer-sized and aligned, so a reader either sees the
+ * old one or the new one -- and publishing head after the entries is what makes
+ * a block visible only once all of it is written.
+ *
+ * This is what the guard words used to do.  A seqlock proved a slice was whole
+ * while it was being read; queueing a block only after ram_submit() has proved
+ * it complete says the same thing earlier and once, and the bound on how deep
+ * the queue may run is what keeps the far end from being reclaimed underneath.
+ */
+typedef struct {
+	uint32_t head;
+	const uint8_t *entry[PCM_QUEUE_SLOTS];
+} __attribute__((aligned(UAC_ERG))) PcmQueue;
 
 /*
  * Feeder-private packetizer cursor.  The callback never reads any of it, which
@@ -327,8 +366,7 @@ typedef struct {
  * fixed slot rotation gets wrong.  It also serves as the priming count.
  */
 typedef struct {
-	uint32_t sequence;
-	uint32_t offset;
+	uint32_t tail;
 	uint32_t write_sequence;
 	int valid;
 } __attribute__((aligned(UAC_ERG))) PcmCursor;
@@ -346,12 +384,14 @@ typedef struct {
 MUST_OWN_WHOLE_GRANULES(TxPump, tx_pump);
 MUST_OWN_WHOLE_GRANULES(CallbackLifetime, callback_lifetime);
 MUST_OWN_WHOLE_GRANULES(PcmSource, pcm_source);
+MUST_OWN_WHOLE_GRANULES(PcmQueue, pcm_queue);
 MUST_OWN_WHOLE_GRANULES(PcmCursor, pcm_cursor);
 
 static TxPump tx = { .pipe = -1 };
 static CallbackLifetime cb;
 /* Producer state, written by audio_tap's capture worker. */
 static PcmSource src;
+static PcmQueue queue;
 /* Consumer state belongs exclusively to the feeder thread. */
 static PcmCursor cur;
 
@@ -429,16 +469,6 @@ static void record_pcm_wait(void)
 }
 #define COUNT_PCM_WAIT() record_pcm_wait()
 
-/* Forward distance on the 1..UINT32_MAX sequence ring; zero if not ahead. */
-static uint32_t pcm_ahead_by(uint32_t newer, uint32_t older)
-{
-	uint32_t distance = newer - older;
-
-	if ((int32_t)distance <= 0)
-		return 0;
-	return newer < older ? distance - 1u : distance;
-}
-
 /*
  * Stored rather than logged inline, because uac_log() writes to the filesystem
  * and doing that from the feeder would stall it and manufacture the very
@@ -448,17 +478,15 @@ static uint32_t pcm_ahead_by(uint32_t newer, uint32_t older)
  * slips start repeating, the opening ones are all onset and say nothing about
  * the state it settles into.
  */
-static void record_slip(uint32_t target, uint32_t expected)
+static void record_slip(int32_t dropped)
 {
 	uint32_t n = __atomic_fetch_add(&slip_count, 1u, __ATOMIC_RELAXED) %
 		SLIP_LOG_MAX;
-	uint32_t ahead = pcm_ahead_by(target, expected);
 
 	slip_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
-	slip_delta[n] = ahead ? (int32_t)ahead :
-		-(int32_t)pcm_ahead_by(expected, target);
+	slip_delta[n] = dropped;
 }
-#define COUNT_SLIP(target, expected) record_slip((target), (expected))
+#define COUNT_SLIP(dropped) record_slip(dropped)
 /*
  * Separates a frozen pipe from a producer that ran away.  A slip says the pin
  * moved by the wrong amount; it does not say which side moved.  Counting
@@ -487,7 +515,7 @@ static void track_freeze(void)
 #define COUNT_STARVE() ((void)0)
 #define COUNT_SUBMIT() ((void)0)
 #define COUNT_PCM_WAIT() ((void)0)
-#define COUNT_SLIP(target, expected) ((void)0)
+#define COUNT_SLIP(dropped) ((void)0)
 #define TRACK_FREEZE() ((void)0)
 #define RESET_FREEZE() ((void)0)
 #endif
@@ -560,28 +588,32 @@ void *uac_stream_capture_claim(void)
 
 	src.previous = src.sequence;
 	src.sequence = sequence;
-	/*
-	 * Odd marks the slice in flight, and the fence keeps that visible before
-	 * Sony's engine starts writing behind it.  A relaxed store plus a release
-	 * fence is one dmb; a seq_cst store would be dmb-str-dmb and buy nothing,
-	 * there being a single producer.  This is the write_seqlock() half.
-	 */
-	__atomic_store_n(&src.guard[sequence & PCM_SLICE_MASK],
-		(sequence << 1) | 1u, __ATOMIC_RELAXED);
-	__atomic_thread_fence(__ATOMIC_RELEASE);
 	return slice(sequence);
 }
 
+/*
+ * Append the completed block, one entry per USB frame it is worth.
+ *
+ * Entries are written before head moves, and head is released, so the feeder
+ * sees a block either not at all or entire.  Nothing here can block or fail:
+ * this runs on the capture worker between two ram_submit() calls, and Sony's
+ * mailbox is one deep, so time spent here is time the engine has nothing queued.
+ */
 void uac_stream_capture_ready(void)
 {
 	uint32_t sequence = src.previous;
+	const uint8_t *base;
+	uint32_t head;
+	uint32_t i;
 
 	/* The first submit of a session has nothing queued behind it. */
 	if (sequence == 0u)
 		return;
-	__atomic_store_n(&src.guard[sequence & PCM_SLICE_MASK], sequence << 1,
-		__ATOMIC_RELEASE);
-	__atomic_store_n(&src.latest, sequence, __ATOMIC_RELEASE);
+	base = slice(sequence);
+	head = queue.head;
+	for (i = 0; i < PACKETS_PER_BLOCK; ++i)
+		queue.entry[(head + i) & PCM_QUEUE_MASK] = base + i * PACKET_BYTES;
+	__atomic_store_n(&queue.head, head + PACKETS_PER_BLOCK, __ATOMIC_RELEASE);
 	signal_pcm();
 }
 
@@ -885,91 +917,60 @@ static int wait_for_free_context(StreamContext **out)
  * published and not yet reclaimed.  That is a weaker statement and is meant to
  * be read as one.
  */
-static int pcm_claimed(uint32_t sequence)
-{
-	return __atomic_load_n(&src.guard[sequence & PCM_SLICE_MASK],
-		__ATOMIC_ACQUIRE) == sequence << 1;
-}
-
-/* Step back one on the 1..UINT32_MAX ring, which skips zero. */
-static uint32_t pcm_back(uint32_t sequence)
-{
-	return sequence == 1u ? UINT32_MAX : sequence - 1u;
-}
-
 /*
- * Re-derive the cursor from latest.  Called at slice boundaries only, because
- * the two packets inside a slice have to come from the same slice.
+ * Take the oldest queued packet, or say there is none.
  *
- * Contiguous playback means landing on the slice after the one just finished.
- * Anything else is the producer and the USB frame timer having disagreed by a
- * whole slice over the last two milliseconds: ahead means a slice was skipped,
- * behind means one is about to be played twice.  Either is audible, both are
- * bounded at 2 ms, and unlike a drifting cursor both are countable -- the pin
- * turns a silent walk into a discrete event with a sign.
- *
- * Returns zero while capture has published nothing to pin to.
+ * Two bounds, and they mean opposite things.  Empty is the transport having
+ * outrun the producer: the frame goes unfilled, which on an adaptive endpoint is
+ * how the device is told its clock is fast, so it is a wait rather than an error
+ * and nothing is invented to fill it.  Past MAX is the producer having outrun
+ * the transport far enough that the oldest entries point into a slice about to
+ * be reclaimed, so the queue is cut back to LEAD and the packets in between are
+ * gone -- audible, counted, and the only place a discontinuity can enter.
  */
-static int pcm_pin(void)
+static int pcm_take(const void **packet)
 {
-	uint32_t latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
-	uint32_t target = latest;
-	uint32_t i;
+	uint32_t head = __atomic_load_n(&queue.head, __ATOMIC_ACQUIRE);
+	uint32_t depth = head - cur.tail;
 
-	if (!cur.valid && latest <= PCM_TRAIL)
-		return 0;
-
-	/* Counts down so the walk stays well formed at a trail of zero. */
-	for (i = PCM_TRAIL; i != 0u; --i)
-		target = pcm_back(target);
-	if (cur.valid) {
-		uint32_t next = next_pcm_sequence(cur.sequence);
-
-		if (target != next)
-			COUNT_SLIP(target, next);
+	if (depth == 0u)
+		return 1;
+	if (depth > PCM_QUEUE_MAX) {
+		COUNT_SLIP((int32_t)(depth - PCM_QUEUE_TARGET));
+		cur.tail = head - PCM_QUEUE_TARGET;
 	}
-	cur.sequence = target;
-	cur.valid = 1;
-	return 1;
+	*packet = queue.entry[cur.tail & PCM_QUEUE_MASK];
+	cur.tail++;
+	return 0;
 }
-
 /* Return zero for a packet, one when no packet is ready. */
 static int pcm_next(const void **packet)
 {
 	/*
 	 * Priming.  uac1 has already selected the alternate setting, so the device
 	 * is live and expecting a packet every millisecond well before capture has
-	 * produced anything -- the tap still has to acquire the route, and enough
-	 * slices have to exist to pin against.  Send silence across that window
-	 * rather than nothing: a gap on an active isochronous endpoint reads as an
-	 * invalid stream to the device, while continuous silence lets it lock
-	 * cleanly and audio simply fades in.  This is also what keeps src.base from
-	 * being read before audio_tap has published it, since latest only leaves
-	 * zero once a slice is complete.
+	 * produced anything -- the tap still has to acquire the route.  Send
+	 * silence across that window rather than nothing: a gap on an active
+	 * isochronous endpoint reads as an invalid stream to the device, while
+	 * continuous silence lets it lock cleanly and audio simply fades in.
+	 *
+	 * Starting lands the queue on TARGET rather than merely past it.  Blocks
+	 * arrive whole, so the first depth to clear the threshold overshoots it,
+	 * and beginning there would fix the swing one block higher than asked for
+	 * and keep it there all session.  Dropping to TARGET costs the packets in
+	 * between, which are the oldest audio of a stream that has not started.
 	 */
-	if (cur.offset == 0u && !pcm_pin()) {
-		*packet = pcm_silence;
-		return 0;
-	}
+	if (!cur.valid) {
+		uint32_t head = __atomic_load_n(&queue.head, __ATOMIC_ACQUIRE);
 
-	/*
-	 * Rewind to the slice boundary so the next call re-pins.  Retrying the
-	 * same slice cannot work: the guard only fails once the producer has
-	 * reclaimed the slot, and it will never hand that sequence back.  Holding
-	 * position mid-slice is therefore permanent -- pcm_pin() runs only at a
-	 * boundary, so the cursor could never reach one again, and the stream goes
-	 * quiet for the rest of the session with nothing but pcm waits to show it.
-	 */
-	if (!pcm_claimed(cur.sequence)) {
-		cur.offset = 0;
-		return 1;
+		if (head - cur.tail < PCM_QUEUE_TARGET) {
+			*packet = pcm_silence;
+			return 0;
+		}
+		cur.tail = head - PCM_QUEUE_TARGET;
+		cur.valid = 1;
 	}
-
-	*packet = slice(cur.sequence) + cur.offset * 4u;
-	cur.offset += PACKET_FRAMES;
-	if (cur.offset == UAC_STREAM_CAPTURE_FRAMES)
-		cur.offset = 0;
-	return 0;
+	return pcm_take(packet);
 }
 
 static void pcm_wait(void)
@@ -1049,7 +1050,7 @@ static void report_session(void)
 	for (i = 0; i < shown; ++i) {
 		uint32_t k = (first + i) % SLIP_LOG_MAX;
 
-		uac_log(LOG_PREFIX "  slip %u at packet %u, pin moved %+d slices\n",
+		uac_log(LOG_PREFIX "  slip %u at packet %u, dropped %+d packets\n",
 			first + i + 1u, slip_at[k], slip_delta[k]);
 	}
 	if (__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED) != 0u)
@@ -1057,18 +1058,19 @@ static void report_session(void)
 			__atomic_load_n(&wait_first, __ATOMIC_RELAXED),
 			__atomic_load_n(&wait_last, __ATOMIC_RELAXED));
 	/*
-	 * The feeder has already left its loop, so the cursor is final.  A trail
-	 * that is not PCM_TRAIL here says the reader stopped following the writer,
-	 * and the offset says whether it stopped mid-slice.
+	 * The feeder has already left its loop, so this is where the queue ended
+	 * up.  Anywhere in FLOOR..TARGET says the two clocks kept station; at zero
+	 * the transport was outrunning the producer and the endpoint was going
+	 * unfed; near MAX the reverse.
 	 */
 	{
-		uint32_t latest = __atomic_load_n(&src.latest, __ATOMIC_ACQUIRE);
+		uint32_t head = __atomic_load_n(&queue.head, __ATOMIC_ACQUIRE);
 
 		uac_log(LOG_PREFIX
-			"  final cursor: seq %u offset %u valid %d, latest %u, "
-			"trail %u\n",
-			cur.sequence, cur.offset, cur.valid, latest,
-			pcm_ahead_by(latest, cur.sequence));
+			"  final queue: head %u tail %u depth %u valid %d "
+			"(swing %u..%u, max %u)\n",
+			head, cur.tail, head - cur.tail, cur.valid,
+			PCM_QUEUE_FLOOR, PCM_QUEUE_TARGET, PCM_QUEUE_MAX);
 	}
 
 	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
@@ -1168,16 +1170,14 @@ int uac_stream_start(int pipe_id)
 	memset(contexts, 0, sizeof(contexts));
 
 	/*
-	 * The source is reset here rather than on the feeder, so it is ordered
-	 * before audio_tap_begin() by the session thread itself.  Guards start
-	 * odd, which is what makes an untouched slice unreadable rather than
-	 * looking like a complete sequence zero.
+	 * The source and the queue are reset here rather than on the feeder, so
+	 * they are ordered before audio_tap_begin() by the session thread itself.
+	 * An empty queue is what holds the feeder on silence until the producer has
+	 * published enough to start from.
 	 */
 	memset(&src, 0, sizeof(src));
-	for (index = 0; index < UAC_STREAM_SLICE_COUNT; ++index)
-		src.guard[index] = 1u;
-	cur.sequence = 0;
-	cur.offset = 0;
+	memset(&queue, 0, sizeof(queue));
+	cur.tail = 0;
 	cur.valid = 0;
 
 	for (index = 0; index < CONTEXT_COUNT; ++index) {
