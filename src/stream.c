@@ -141,16 +141,22 @@ STATIC_ASSERT(UAC_ERG != 0u && (UAC_ERG & (UAC_ERG - 1u)) == 0u,
 #endif
 
 /*
- * Sony's DMA rounds its write up to a 256-byte multiple, so a slice has to hold
- * the rounded size rather than the block size.  A 576-byte block packed into a
- * 576-byte slice rounds to 768 and spills 192 bytes into the next slice, which
- * is audible as distortion rather than a click because it corrupts every block.
- * Leave headroom; do not pack the stride down to the payload.
+ * Sony's DMA writes past the block, to the next 256-byte multiple STRICTLY
+ * greater than it -- never to the block itself, even when the block is already a
+ * multiple.  Three geometries agree: 384 bytes writes 512, 576 writes 768 (a
+ * 576-byte stride spilled exactly 192 into its neighbour), and 768 writes 1024
+ * (a 768-byte stride distorted; 1024 plays clean).
+ *
+ * A ceiling rounding models the first two and gets the third wrong, which is how
+ * a 768-in-768 arrangement passed this assertion and reached hardware.  Divide
+ * and add one instead, so a block that lands on a boundary still claims the next
+ * one.  Corruption here is continuous rather than a click, because it lands in
+ * every block.
  */
 #define DMA_WRITE_ROUND 256u
-STATIC_ASSERT(UAC_STREAM_SLICE_BYTES >=
-	((UAC_STREAM_CAPTURE_BYTES + DMA_WRITE_ROUND - 1u) / DMA_WRITE_ROUND) *
-		DMA_WRITE_ROUND,
+#define DMA_WRITE_SIZE(bytes) \
+	(((bytes) / DMA_WRITE_ROUND + 1u) * DMA_WRITE_ROUND)
+STATIC_ASSERT(UAC_STREAM_SLICE_BYTES >= DMA_WRITE_SIZE(UAC_STREAM_CAPTURE_BYTES),
 	slice_must_hold_the_rounded_up_dma_write);
 STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
