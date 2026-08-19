@@ -75,13 +75,24 @@
  * every unit of it is a millisecond of latency bought with a millisecond of
  * tolerance for the producer arriving late.
  *
- * MAX is not a preference.  An entry points into a slice, so it has to reach the
- * wire before Sony reclaims that slice, and at enqueue the engine has already
- * claimed the block after it -- leaving (COUNT - 1) block periods.  A packet
- * spends that budget twice over, once waiting in the queue and again waiting in
- * the schedule, so what is left for depth is the budget less the requests USBD
- * already holds.  Exceed it and the controller reads a slice the engine has
- * begun rewriting, which no counter here can see.
+ * MAX bounds how long an entry may wait, because it points into a slice and has
+ * to reach the wire before Sony writes that slice again.  It is kept at
+ * (COUNT - 1) block periods less the requests USBD holds, which is stricter than
+ * it needs to be and deliberately so.
+ *
+ * That figure was derived on the assumption that the engine writes a block
+ * across its whole period, making a slice unsafe from the moment it is reclaimed.
+ * Walking the floor up disproves it: at six the deepest read lands exactly on
+ * the bound, at eight two past it, at ten a full rotation of the ring past it,
+ * and all three play clean.  So the engine empties a buffer in a burst and then
+ * idles -- which is also why the write rounds to 256-byte units, and why reading
+ * a block the mailbox had only just released was safe back when there was a
+ * cursor.  The unsafe window is microseconds, not a period.
+ *
+ * The bound stays tight anyway.  Nothing needs the room: the floor stops buying
+ * anything above four, so the spare depth would be latency spent on nothing, and
+ * a burst that ever did overrun its slice would tear silently -- no counter here
+ * can see it.
  */
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
 #define PCM_QUEUE_SLOTS 16u
