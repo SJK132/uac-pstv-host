@@ -86,18 +86,22 @@
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
-#define PCM_QUEUE_FLOOR 3u
+#define PCM_QUEUE_FLOOR 5u
 #define PCM_QUEUE_TARGET (PACKETS_PER_BLOCK + PCM_QUEUE_FLOOR)
 #define PCM_QUEUE_MAX \
 	((UAC_STREAM_SLICE_COUNT - 1u) * PACKETS_PER_BLOCK - MAX_IN_FLIGHT)
 /*
- * Transport depth: three requests owned by USBD and one READY context.  The
- * fourth lets the feeder prepare the next millisecond without touching
- * DMA-owned storage, while three queued frames keep SceUsbd's periodic cursor
- * ahead.
+ * Transport depth, and it comes out of the same budget the queue does: a packet
+ * held by USBD is a packet not yet on the wire, so every request in flight is a
+ * millisecond the queue may not use.
+ *
+ * Two rather than three, because the evidence says which side needs it.  The
+ * feeder has never once been late -- no starves across better than four hundred
+ * thousand packets -- while the producer margin is audible the moment it is
+ * short.  So one millisecond moves from the schedule to the floor.
  */
 #define CONTEXT_COUNT 4u
-#define MAX_IN_FLIGHT 3u
+#define MAX_IN_FLIGHT 2u
 
 /*
  * USBD may deliver a completion after its pipe has been closed and the static
