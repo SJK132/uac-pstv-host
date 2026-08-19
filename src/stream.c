@@ -4,17 +4,21 @@
  * Two halves that meet in the middle:
  *
  *   - the source side is Sony's own audio engine, writing captured PCM into
- *     slices of AVConfig's RAM-output region;
- *   - the transport side runs one feeder thread that cuts those slices into
- *     48-frame (1 ms) packets and keeps three isochronous requests in flight,
- *     with one context staged behind them.
+ *     slices of AVConfig's RAM-output region and handing each finished block
+ *     to a queue as four 1 ms packets;
+ *   - the transport side runs one feeder thread that drains that queue a packet
+ *     per frame, pointing the host controller straight at the slice.
  *
- * Staging is latest-wins, and deliberately not a FIFO.  Producer and consumer
- * run off unrelated clocks -- Sony's audio hardware and the USB host's frame
- * timer -- so they are never rate-matched, and USB completions have been
- * measured stalling for 250 ms at a stretch.  Latest-wins throws the backlog
- * away and resumes at current audio for the price of one discontinuity; a FIFO
- * would add that 250 ms to output latency permanently, again on each stall.
+ * Nothing copies the audio and nothing samples a position: the producer sets
+ * both the content and the pace, and the queue depth is the only state between
+ * them.  Its two bounds are the only places a discontinuity can enter, and both
+ * are counted.
+ *
+ * The queue is latest-wins at the top, deliberately, and not a FIFO.  USB
+ * completions have been measured stopping for 250 ms at a stretch with a full
+ * pipe, which is below this layer and not ours to prevent.  Discarding the
+ * backlog costs one break and resumes at current audio; a FIFO would add that
+ * quarter second to output latency permanently, again on every stall.
  *
  * session.c owns this file's lifecycle: uac_stream_start(), uac_stream_stop()
  * and uac_stream_pipe_closed() are called from the session thread and nowhere
@@ -29,7 +33,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <psp2kern/kernel/cpu/cache.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/usbd.h>
 
@@ -83,7 +86,7 @@
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
-#define PCM_QUEUE_FLOOR 4u
+#define PCM_QUEUE_FLOOR 3u
 #define PCM_QUEUE_TARGET (PACKETS_PER_BLOCK + PCM_QUEUE_FLOOR)
 #define PCM_QUEUE_MAX \
 	((UAC_STREAM_SLICE_COUNT - 1u) * PACKETS_PER_BLOCK - MAX_IN_FLIGHT)
@@ -108,7 +111,6 @@
 #define CALLBACK_REFS 0x7fffffffu
 
 #define FREE_EVENT_BIT 0x00000001u
-#define PCM_EVENT_BIT 0x00000002u
 #define STOP_POLL_US 1000u
 #define STOP_POLLS 50u
 /*
@@ -122,12 +124,17 @@
  * Feeder scheduling.  0x40 is the bottom of the kernel band and a poor place
  * for a thread with a 1 ms deadline; 0x20 lifts it clear while staying below
  * the capture worker's 0x12, which must not be starved because it is the
- * producer.  Per wakeup the feeder claims a context, copies 192 bytes and
- * blocks again, so it cannot monopolise a core.
+ * producer.  Per wakeup the feeder takes a context, pops a pointer and blocks
+ * again, so it cannot monopolise a core.
  *
- * The affinity is a cache decision rather than a scheduling one: pinned to the
- * capture worker's core (CAPTURE_CPU_MASK in audio_tap.c), a slice Sony has
- * just filled is still in L1 when the feeder reads it out.
+ * The affinity outlived its reason.  It was a cache decision -- share the
+ * capture worker's core (CAPTURE_CPU_MASK in audio_tap.c) and a slice Sony had
+ * just filled would still be in L1 when the feeder copied it out -- but the
+ * feeder no longer reads the audio at all, so there is nothing left to be warm.
+ * What sharing a core does now is put the two threads in each other's way, the
+ * capture worker holding spinlocks inside ram_submit() while the feeder has a
+ * 1 ms deadline.  Worth measuring apart; left alone because it is what every
+ * session so far was measured on.
  */
 #define FEEDER_PRIORITY 0x20
 #define FEEDER_CPU_MASK 0x80000u
@@ -413,7 +420,6 @@ static PcmCursor cur;
  * so nothing here can invalidate a granule another core is holding.
  */
 static SceUID free_event = -1;
-static SceUID pcm_event = -1;
 static SceUID feeder_thread = -1;
 
 /*
@@ -574,12 +580,6 @@ static void publish_free_context(void)
 		(void)ksceKernelSetEventFlag(free_event, FREE_EVENT_BIT);
 }
 
-static void signal_pcm(void)
-{
-	if (pcm_event >= 0)
-		(void)ksceKernelSetEventFlag(pcm_event, PCM_EVENT_BIT);
-}
-
 /* ksceKernelClearEventFlag() takes the mask of bits to KEEP, so zero resets. */
 static void reset_event(SceUID event)
 {
@@ -647,7 +647,6 @@ void uac_stream_capture_ready(void)
 	for (i = 0; i < PACKETS_PER_BLOCK; ++i)
 		queue.entry[(head + i) & PCM_QUEUE_MASK] = base + i * PACKET_BYTES;
 	__atomic_store_n(&queue.head, head + PACKETS_PER_BLOCK, __ATOMIC_RELEASE);
-	signal_pcm();
 }
 
 static void finish_retire(void)
@@ -707,7 +706,6 @@ static void stop_stream(int result, uint16_t status)
 
 	__atomic_fetch_or(&cb.guard, CALLBACK_CLOSING, __ATOMIC_ACQ_REL);
 	publish_free_context();
-	signal_pcm();
 	uac1_stream_failed();
 	if (result < 0)
 		uac_log(LOG_PREFIX "transfer failed: 0x%08x\n", result);
@@ -976,8 +974,7 @@ static int pcm_take(const void **packet)
 	cur.tail++;
 	return 0;
 }
-/* Return zero for a packet, one when no packet is ready. */
-static int pcm_next(const void **packet)
+static void pcm_next(const void **packet)
 {
 	/*
 	 * Priming.  uac1 has already selected the alternate setting, so the device
@@ -998,7 +995,7 @@ static int pcm_next(const void **packet)
 
 		if (head - cur.tail < PCM_QUEUE_TARGET) {
 			*packet = pcm_silence;
-			return 0;
+			return;
 		}
 		cur.tail = head - PCM_QUEUE_TARGET;
 		cur.valid = 1;
@@ -1026,18 +1023,6 @@ static int pcm_next(const void **packet)
 		*packet = cur.last;
 	}
 	cur.last = *packet;
-	return 0;
-}
-
-static void pcm_wait(void)
-{
-	uint32_t matched;
-	int result;
-
-	result = ksceKernelWaitEventFlag(pcm_event, PCM_EVENT_BIT,
-		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &matched, NULL);
-	if (result < 0)
-		stop_stream(result, USBD_CC_NOERR);
 }
 
 /*
@@ -1050,20 +1035,15 @@ static void pcm_wait(void)
  * completion is delayed, and a packet copied before it goes stale while we sit
  * in it.
  */
-static int queue_next_source_packet(void)
+static void queue_next_source_packet(void)
 {
 	StreamContext *context;
 	const void *packet;
 	uint32_t sequence;
 
 	if (!wait_for_free_context(&context))
-		return 0;
-
-	if (pcm_next(&packet) != 0) {
-		__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
-		publish_free_context();
-		return 1;
-	}
+		return;
+	pcm_next(&packet);
 
 	/*
 	 * The whole of staging, now: the controller is pointed at Sony's slice and
@@ -1083,7 +1063,6 @@ static int queue_next_source_packet(void)
 		__atomic_store_n(&tx.primed, 1, __ATOMIC_RELEASE);
 	if (__atomic_load_n(&tx.primed, __ATOMIC_ACQUIRE))
 		pump_ready();
-	return 0;
 }
 
 #ifdef UAC_PSTV_ENABLE_LOGGING
@@ -1181,17 +1160,8 @@ static int usb_feeder_thread(SceSize args, void *argp)
 	 * whole of AVConfig's ~400 ms convergence rather than seeing a gap; PCM
 	 * simply starts arriving partway through, and pcm_next() switches to it.
 	 */
-	while (stream_running()) {
-		/*
-		 * A context with no PCM to put in it.  If this tracks the starve
-		 * count, the shortfall is on the producer side and feeder
-		 * priority is irrelevant.
-		 */
-		if (queue_next_source_packet()) {
-			COUNT_PCM_WAIT();
-			pcm_wait();
-		}
-	}
+	while (stream_running())
+		queue_next_source_packet();
 	REPORT_SESSION();
 	return 0;
 }
@@ -1228,7 +1198,7 @@ int uac_stream_start(int pipe_id)
 	int thread;
 	int result;
 
-	if (pipe_id < 0 || free_event < 0 || pcm_event < 0)
+	if (pipe_id < 0 || free_event < 0)
 		return -1;
 	/*
 	 * A feeder outliving its session means the last reap failed.  Refuse
@@ -1277,7 +1247,6 @@ int uac_stream_start(int pipe_id)
 	}
 
 	reset_event(free_event);
-	reset_event(pcm_event);
 	publish_free_context();
 
 	thread = ksceKernelCreateThread("uac_usb_feeder", usb_feeder_thread,
@@ -1320,7 +1289,6 @@ void uac_stream_stop(void)
 	__atomic_store_n(&tx.state, STREAM_STOPPING, __ATOMIC_RELEASE);
 	__atomic_fetch_or(&cb.guard, CALLBACK_CLOSING, __ATOMIC_ACQ_REL);
 	publish_free_context();
-	signal_pcm();
 
 	result = reap_feeder(FEEDER_STOP_TIMEOUT_US);
 	if (result < 0)
@@ -1349,7 +1317,6 @@ void uac_stream_pipe_closed(int pipe_id)
 	(void)next_generation();
 	__atomic_store_n(&tx.pipe, -1, __ATOMIC_RELEASE);
 	publish_free_context();
-	signal_pcm();
 	finish_retire();
 }
 
@@ -1363,15 +1330,6 @@ int uac_stream_init(void)
 			return event;
 		free_event = event;
 	}
-	if (pcm_event < 0) {
-		event = ksceKernelCreateEventFlag("uac_pcm_source", 0, 0, NULL);
-		if (event < 0) {
-			if (ksceKernelDeleteEventFlag(free_event) >= 0)
-				free_event = -1;
-			return event;
-		}
-		pcm_event = event;
-	}
 	return 0;
 }
 
@@ -1383,12 +1341,6 @@ int uac_stream_shutdown(void)
 	if (__atomic_load_n(&feeder_thread, __ATOMIC_ACQUIRE) >= 0 ||
 	    __atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) != STREAM_IDLE)
 		return -1;
-	if (pcm_event >= 0) {
-		result = ksceKernelDeleteEventFlag(pcm_event);
-		if (result < 0)
-			return result;
-		pcm_event = -1;
-	}
 	if (free_event >= 0) {
 		result = ksceKernelDeleteEventFlag(free_event);
 		if (result < 0)
