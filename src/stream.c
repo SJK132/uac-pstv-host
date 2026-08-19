@@ -52,22 +52,21 @@
  * can leave the reader behind, because the reader has no position of its own to
  * fall behind with.  It is wherever the writer says it is.
  *
- * One is the floor and it turned out to be too close.  ram_submit() returns once
- * the previous buffer has left Sony's one-deep mailbox, so publishing latest
- * means the engine has just taken that block; the argument that latest - 1 is
- * therefore finished is sound and still produced continuous distortion, which is
- * exactly what reading under the pen sounds like.  The mailbox says when a buffer
- * was handed over, not when the engine stopped writing it, and those are not the
- * same instant.
+ * ram_submit() returns once the previous buffer has left Sony's one-deep
+ * mailbox, so latest is a block the engine has finished rather than one it is
+ * still writing.  Four and one both play clean, so the floor is at most one and
+ * the distance is latency to spend rather than safety to buy: each slice is a
+ * block period, 2 ms.  Zero reads the block just published, which is the
+ * shortest the mailbox can be argued to allow and leaves nothing in hand if the
+ * engine ever lingers past the handover.
  *
- * So stand well back.  Four is five slices behind the block being written and
- * one short of the ceiling, which leaves two block periods before Sony reclaims
- * the slice under the cursor.  Eight milliseconds of trail against four of slack:
- * the distortion this trades away is the one failure the design cannot report on
- * itself, because a slice torn this way was marked complete a block ago, is not
- * reclaimed for another seven, and passes the seqlock intact.
+ * Being too close is the one failure this design cannot report.  A slice torn
+ * under the pen was marked complete before the cursor reached it and is not
+ * reclaimed for another COUNT - 1, so the seqlock passes, every counter stays
+ * clean, and the only symptom is continuous distortion.  Walk this down by ear,
+ * not by argument.
  */
-#define PCM_TRAIL 1u
+#define PCM_TRAIL 0u
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -162,8 +161,8 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
  * for -- so the cursor may not sit at COUNT - 1 or COUNT - 2 behind latest,
  * which is exactly COUNT - 3.  The mailbox sets the floor at one.
  */
-STATIC_ASSERT(PCM_TRAIL >= 1u && PCM_TRAIL <= UAC_STREAM_SLICE_COUNT - 3u,
-	pinned_trail_must_clear_the_dma_and_the_lap);
+STATIC_ASSERT(PCM_TRAIL <= UAC_STREAM_SLICE_COUNT - 3u,
+	pinned_trail_must_clear_the_lap);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
@@ -883,7 +882,8 @@ static int pcm_pin(void)
 	if (!cur.valid && latest <= PCM_TRAIL)
 		return 0;
 
-	for (i = 0; i < PCM_TRAIL; ++i)
+	/* Counts down so the walk stays well formed at a trail of zero. */
+	for (i = PCM_TRAIL; i != 0u; --i)
 		target = pcm_back(target);
 	if (cur.valid) {
 		uint32_t next = next_pcm_sequence(cur.sequence);
