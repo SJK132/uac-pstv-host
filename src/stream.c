@@ -455,6 +455,19 @@ static uint32_t slip_at[SLIP_LOG_MAX];
 static int32_t slip_delta[SLIP_LOG_MAX];
 static uint32_t wait_first;
 static uint32_t wait_last;
+/*
+ * The two clamps are the drift meter.  Neither clock is observable directly, but
+ * every packet repeated is 48 frames delivered that Sony never made, and every
+ * packet dropped is 48 frames made that were never delivered.  The running
+ * difference over the packets sent is the rate error between Sony's audio clock
+ * and the USB frame timer, in parts per million, which is the number this has
+ * been guessing at all along.
+ */
+static uint32_t dropped_packets;
+#define FREEZE_LOG_MAX 8u
+static uint32_t freeze_at[FREEZE_LOG_MAX];
+static uint32_t freeze_gap[FREEZE_LOG_MAX];
+static uint32_t freeze_flight[FREEZE_LOG_MAX];
 #define COUNT_STARVE() __atomic_add_fetch(&starve_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_SUBMIT() __atomic_add_fetch(&submit_count, 1u, __ATOMIC_RELAXED)
 
@@ -489,6 +502,7 @@ static void record_slip(int32_t dropped)
 
 	slip_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
 	slip_delta[n] = dropped;
+	__atomic_add_fetch(&dropped_packets, (uint32_t)dropped, __ATOMIC_RELAXED);
 }
 #define COUNT_SLIP(dropped) record_slip(dropped)
 /*
@@ -501,6 +515,7 @@ static void track_freeze(void)
 {
 	uint32_t now = ksceKernelGetSystemTimeLow();
 	uint32_t gap;
+	uint32_t n;
 
 	if (!cb.completion_seen) {
 		cb.completion_seen = 1;
@@ -510,8 +525,22 @@ static void track_freeze(void)
 	/* Unsigned difference stays correct across the counter's ~71 min wrap. */
 	gap = now - cb.completion_at;
 	cb.completion_at = now;
-	if (gap >= FREEZE_GAP_US)
-		__atomic_add_fetch(&freeze_count, 1u, __ATOMIC_RELAXED);
+	if (gap < FREEZE_GAP_US)
+		return;
+
+	n = __atomic_fetch_add(&freeze_count, 1u, __ATOMIC_RELAXED) %
+		FREEZE_LOG_MAX;
+	freeze_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
+	freeze_gap[n] = gap;
+	/*
+	 * This runs before the completion drops its own reference, so the count
+	 * includes the request reporting in.  One means nothing else was
+	 * outstanding and the schedule had emptied behind us -- our fault, and
+	 * the feeder is where to look.  Three means the controller stopped with
+	 * a full pipe, which is its scheduling and not something this side can
+	 * reach.  It is the only field that tells the two apart.
+	 */
+	freeze_flight[n] = __atomic_load_n(&tx.in_flight, __ATOMIC_ACQUIRE);
 }
 #define TRACK_FREEZE() track_freeze()
 #define RESET_FREEZE() (cb.completion_seen = 0)
@@ -1084,6 +1113,20 @@ static void report_session(void)
 		uac_log(LOG_PREFIX "  pcm waits spanned packets %u..%u\n",
 			__atomic_load_n(&wait_first, __ATOMIC_RELAXED),
 			__atomic_load_n(&wait_last, __ATOMIC_RELAXED));
+	{
+		uint32_t fz = __atomic_load_n(&freeze_count, __ATOMIC_RELAXED);
+		uint32_t fz_shown = fz < FREEZE_LOG_MAX ? fz : FREEZE_LOG_MAX;
+		uint32_t fz_first = fz - fz_shown;
+
+		for (i = 0; i < fz_shown; ++i) {
+			uint32_t k = (fz_first + i) % FREEZE_LOG_MAX;
+
+			uac_log(LOG_PREFIX
+				"  freeze %u at packet %u, %u us, %u in flight\n",
+				fz_first + i + 1u, freeze_at[k], freeze_gap[k],
+				freeze_flight[k]);
+		}
+	}
 	/*
 	 * The feeder has already left its loop, so this is where the queue ended
 	 * up.  Anywhere in FLOOR..TARGET says the two clocks kept station; at zero
@@ -1099,12 +1142,29 @@ static void report_session(void)
 			head, cur.tail, head - cur.tail, cur.valid,
 			PCM_QUEUE_FLOOR, PCM_QUEUE_TARGET, PCM_QUEUE_MAX);
 	}
+	{
+		uint32_t sent = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
+		uint32_t rep = __atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED);
+		uint32_t drop = __atomic_load_n(&dropped_packets, __ATOMIC_RELAXED);
+		/* Signed, and scaled before the divide so integer maths keeps the
+		 * resolution: one packet in a million is one ppm. */
+		int32_t net = (int32_t)rep - (int32_t)drop;
+		int32_t ppm = sent ? (int32_t)((int64_t)net * 1000000 / sent) : 0;
+
+		uac_log(LOG_PREFIX
+			"  clock: %u repeated, %u dropped of %u packets"
+			" = %+d ppm (%s)\n",
+			rep, drop, sent, ppm,
+			ppm > 0 ? "USB frame timer faster than Sony" :
+			ppm < 0 ? "Sony faster than USB frame timer" : "matched");
+	}
 
 	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&starve_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&pcm_wait_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&slip_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&freeze_count, 0u, __ATOMIC_RELAXED);
+	__atomic_store_n(&dropped_packets, 0u, __ATOMIC_RELAXED);
 }
 #define REPORT_SESSION() report_session()
 #else
