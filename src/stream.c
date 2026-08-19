@@ -52,14 +52,22 @@
  * can leave the reader behind, because the reader has no position of its own to
  * fall behind with.  It is wherever the writer says it is.
  *
- * At four slices the ceiling is one, so this is the only value there is.  What
- * makes it safe is not distance but causation: the cursor moves when
- * capture_ready() publishes and at no other time, so it cannot creep toward the
- * engine between publications the way a sampled cursor can.  Two block periods
- * still pass before Sony reclaims the slice under it, which at 4 ms a block is
- * 8 ms of slack -- more, in wall clock, than eight 96-frame slices gave at four.
+ * One is the floor and it turned out to be too close.  ram_submit() returns once
+ * the previous buffer has left Sony's one-deep mailbox, so publishing latest
+ * means the engine has just taken that block; the argument that latest - 1 is
+ * therefore finished is sound and still produced continuous distortion, which is
+ * exactly what reading under the pen sounds like.  The mailbox says when a buffer
+ * was handed over, not when the engine stopped writing it, and those are not the
+ * same instant.
+ *
+ * So stand well back.  Four is five slices behind the block being written and
+ * one short of the ceiling, which leaves two block periods before Sony reclaims
+ * the slice under the cursor.  Eight milliseconds of trail against four of slack:
+ * the distortion this trades away is the one failure the design cannot report on
+ * itself, because a slice torn this way was marked complete a block ago, is not
+ * reclaimed for another seven, and passes the seqlock intact.
  */
-#define PCM_TRAIL 1u
+#define PCM_TRAIL 4u
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
@@ -297,10 +305,6 @@ typedef struct {
 typedef struct {
 	uint32_t sequence;
 	uint32_t offset;
-	/* The value of latest that released the slice being played.  The cursor
-	 * advances only when this changes, which is what ties a slice consumed to
-	 * a slice published rather than to the frame timer. */
-	uint32_t seen;
 	uint32_t write_sequence;
 	int valid;
 } __attribute__((aligned(UAC_ERG))) PcmCursor;
@@ -401,45 +405,6 @@ static void record_pcm_wait(void)
 }
 #define COUNT_PCM_WAIT() record_pcm_wait()
 
-/*
- * Sony is asked for CAPTURE_FRAMES and nothing so far proves the engine writes
- * them.  Stamp the first and last word of the payload before handing the slice
- * over, and look again once the mailbox says that slice is done.
- *
- * A surviving last word means the write stopped short and the tail of every
- * block is whatever was there four blocks ago -- continuous distortion, and
- * invisible to the seqlock, which only knows the slice was published.  Both
- * words surviving means the engine never touched it.  This is the one question
- * the guard protocol cannot answer about its own payload, and it is the
- * difference between knowing a geometry is wrong and guessing at it.
- */
-#define SLICE_SENTINEL 0x5a3c69c3u
-#define SLICE_TAIL_WORD (UAC_STREAM_CAPTURE_BYTES / 4u - 1u)
-static uint32_t short_count;
-static uint32_t unfilled_count;
-
-static void stamp_slice(void *base)
-{
-	uint32_t *words = base;
-
-	words[0] = SLICE_SENTINEL;
-	words[SLICE_TAIL_WORD] = SLICE_SENTINEL;
-}
-
-static void check_slice(const void *base)
-{
-	const uint32_t *words = base;
-
-	if (words[SLICE_TAIL_WORD] != SLICE_SENTINEL)
-		return;
-	if (words[0] == SLICE_SENTINEL)
-		__atomic_add_fetch(&unfilled_count, 1u, __ATOMIC_RELAXED);
-	else
-		__atomic_add_fetch(&short_count, 1u, __ATOMIC_RELAXED);
-}
-#define STAMP_SLICE(base) stamp_slice(base)
-#define CHECK_SLICE(base) check_slice(base)
-
 /* Forward distance on the 1..UINT32_MAX sequence ring; zero if not ahead. */
 static uint32_t pcm_ahead_by(uint32_t newer, uint32_t older)
 {
@@ -499,8 +464,6 @@ static void track_freeze(void)
 #define COUNT_SUBMIT() ((void)0)
 #define COUNT_PCM_WAIT() ((void)0)
 #define COUNT_SLIP(target, expected) ((void)0)
-#define STAMP_SLICE(base) ((void)0)
-#define CHECK_SLICE(base) ((void)0)
 #define TRACK_FREEZE() ((void)0)
 #define RESET_FREEZE() ((void)0)
 #endif
@@ -562,7 +525,6 @@ void *uac_stream_capture_claim(void)
 
 	src.previous = src.sequence;
 	src.sequence = sequence;
-	STAMP_SLICE(slice(sequence));
 	/*
 	 * Odd marks the slice in flight, and the fence keeps that visible before
 	 * Sony's engine starts writing behind it.  A relaxed store plus a release
@@ -582,7 +544,6 @@ void uac_stream_capture_ready(void)
 	/* The first submit of a session has nothing queued behind it. */
 	if (sequence == 0u)
 		return;
-	CHECK_SLICE(slice(sequence));
 	__atomic_store_n(&src.guard[sequence & PCM_SLICE_MASK], sequence << 1,
 		__ATOMIC_RELEASE);
 	__atomic_store_n(&src.latest, sequence, __ATOMIC_RELEASE);
@@ -919,22 +880,8 @@ static int pcm_pin(void)
 	uint32_t target = latest;
 	uint32_t i;
 
-	if (!cur.valid) {
-		if (latest <= PCM_TRAIL)
-			return 0;
-	} else if (latest == cur.seen) {
-		/*
-		 * Nothing has been published since the slice now finishing was
-		 * released, so there is no next slice to move to.  Sampling
-		 * latest on our own boundary instead would advance on a value
-		 * that has not changed, and the two clocks are not locked, so
-		 * that reads as the producer stepping twice and then not at all.
-		 * Waiting is the whole of the synchronisation: one slice played
-		 * per slice published, caused by the publication.
-		 */
+	if (!cur.valid && latest <= PCM_TRAIL)
 		return 0;
-	}
-	cur.seen = latest;
 
 	for (i = 0; i < PCM_TRAIL; ++i)
 		target = pcm_back(target);
@@ -964,14 +911,6 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	 * zero once a slice is complete.
 	 */
 	if (cur.offset == 0u && !pcm_pin()) {
-		/*
-		 * Mid-stream this is the producer not having released the next
-		 * slice yet, which is a wait rather than a reason to invent
-		 * audio; the context goes back and the next millisecond retries.
-		 * Only before the first release does silence belong here.
-		 */
-		if (cur.valid)
-			return 1;
 		memset(packet, 0, PACKET_BYTES);
 		return 0;
 	}
@@ -1054,13 +993,11 @@ static void report_session(void)
 
 	uac_log(LOG_PREFIX
 		"session: %u packets, %u starved, %u pcm waits, %u slips, "
-		"%u freezes, %u short blocks, %u unfilled\n",
+		"%u freezes\n",
 		__atomic_load_n(&submit_count, __ATOMIC_RELAXED),
 		__atomic_load_n(&starve_count, __ATOMIC_RELAXED),
 		__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED), total,
-		__atomic_load_n(&freeze_count, __ATOMIC_RELAXED),
-		__atomic_load_n(&short_count, __ATOMIC_RELAXED),
-		__atomic_load_n(&unfilled_count, __ATOMIC_RELAXED));
+		__atomic_load_n(&freeze_count, __ATOMIC_RELAXED));
 	/* Numbered by their real ordinal, so a run reads 331..338 rather than 1..8
 	 * and the packet numbers show how far apart they are firing. */
 	for (i = 0; i < shown; ++i) {
@@ -1093,8 +1030,6 @@ static void report_session(void)
 	__atomic_store_n(&pcm_wait_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&slip_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&freeze_count, 0u, __ATOMIC_RELAXED);
-	__atomic_store_n(&short_count, 0u, __ATOMIC_RELAXED);
-	__atomic_store_n(&unfilled_count, 0u, __ATOMIC_RELAXED);
 }
 #define REPORT_SESSION() report_session()
 #else
@@ -1197,7 +1132,6 @@ int uac_stream_start(int pipe_id)
 		src.guard[index] = 1u;
 	cur.sequence = 0;
 	cur.offset = 0;
-	cur.seen = 0;
 	cur.valid = 0;
 
 	for (index = 0; index < CONTEXT_COUNT; ++index) {
