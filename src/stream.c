@@ -214,17 +214,14 @@ STATIC_ASSERT(offsetof(SonyIsoTransfer, packets) == 0x08u,
 #endif
 
 /*
- * CONTEXT_ALIGN is a DMA constraint, not a cache one.  buffer[] is the only
- * storage the host controller reads directly, and EHCI addresses transfer
- * buffers as a page plus an offset, so one that straddles a 4 KiB boundary
- * needs the descriptor's second page pointer programmed too.  Aligning each
- * context to a divisor of the page size, buffer first and no larger than that
- * alignment, keeps every buffer inside one page by construction.
+ * A context no longer carries a buffer.  The host controller reads Sony's slice
+ * where it lies, so what used to be staging storage is now just a pointer set
+ * per submit, and CONTEXT_ALIGN is only keeping each context's state word out of
+ * its neighbour's reservation granule.
  */
-#define CONTEXT_ALIGN 256u
+#define CONTEXT_ALIGN 64u
 
 typedef struct {
-	uint8_t buffer[PACKET_BYTES] __attribute__((aligned(64)));
 	SonyIsoTransfer transfer __attribute__((aligned(64)));
 	uint32_t callback_token;
 	uint32_t sequence;
@@ -233,8 +230,30 @@ typedef struct {
 
 STATIC_ASSERT(sizeof(StreamContext) == CONTEXT_ALIGN,
 	context_must_tile_its_alignment);
-STATIC_ASSERT(PACKET_BYTES <= CONTEXT_ALIGN, context_buffer_must_fit_one_block);
-STATIC_ASSERT(4096u % CONTEXT_ALIGN == 0u, context_blocks_must_tile_a_page);
+STATIC_ASSERT(CONTEXT_ALIGN >= UAC_ERG,
+	contexts_must_not_share_a_reservation_granule);
+
+/*
+ * EHCI addresses a transfer buffer as a page plus an offset, so one straddling a
+ * 4 KiB boundary needs the descriptor's second page pointer programmed too.
+ * Every packet the controller reads must therefore sit inside one page.
+ *
+ * Two of the three conditions are geometry and are settled here: packets tile a
+ * slice, and the slice stride divides a page.  The third is where Sony's region
+ * happens to start, which only the firmware knows, so it is checked once when
+ * the region is published.
+ */
+STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % PACKET_BYTES == 0u ||
+	(UAC_STREAM_CAPTURE_BYTES / PACKET_BYTES) * PACKET_BYTES <=
+		UAC_STREAM_SLICE_BYTES,
+	packets_must_tile_a_slice);
+STATIC_ASSERT(4096u % UAC_STREAM_SLICE_BYTES == 0u,
+	slice_stride_must_divide_a_page);
+
+/* Sent while capture has published nothing yet; read by the controller, so it
+ * needs the same page containment as a slice does. */
+static const uint8_t pcm_silence[PACKET_BYTES]
+	__attribute__((aligned(4096)));
 
 static StreamContext contexts[CONTEXT_COUNT]
 	__attribute__((aligned(CONTEXT_ALIGN)));
@@ -521,6 +540,17 @@ static uint8_t *slice(uint32_t sequence)
 
 void uac_stream_capture_region(void *base)
 {
+	/*
+	 * The controller reads these slices directly, and the geometry only keeps
+	 * a packet inside one page if the first slice starts on a stride boundary.
+	 * Sony's region has always been aligned well past that, so this is a net
+	 * rather than a branch -- but an unaligned base would show up as one
+	 * packet in four arriving corrupt, which is not a thing worth debugging by
+	 * ear a second time.
+	 */
+	if (((uintptr_t)base % UAC_STREAM_SLICE_BYTES) != 0u)
+		uac_log(LOG_PREFIX "capture base %p is not %u-aligned; packets "
+			"may straddle a page\n", base, UAC_STREAM_SLICE_BYTES);
 	__atomic_store_n(&src.base, base, __ATOMIC_RELEASE);
 }
 
@@ -643,8 +673,20 @@ static int submit_context(StreamContext *context)
 	if (pipe < 0)
 		return 1;
 
-	/* After the aborts, not before: a teardown should not pay for a flush. */
-	ksceKernelDcacheCleanRange(context->buffer, PACKET_BYTES);
+	/*
+	 * No cache maintenance.  Nothing on this side writes the bytes the
+	 * controller is about to read -- Sony's engine put them in memory by DMA
+	 * and we only ever load from them -- so there is no dirty line to clean,
+	 * and cleaning would risk writing a stale one back over the engine's work.
+	 *
+	 * The cost of that is the buffer staying live until this completes.  A
+	 * queued request holds a pointer into a slice for as long as the schedule
+	 * takes to reach it, which is a frame or three normally and one whole wrap
+	 * of the periodic list when the pipe freezes.  The ring turns over in
+	 * COUNT block periods, so a freeze outlives it and the controller sends
+	 * whatever the engine has since written there.  That is the price of not
+	 * copying, and it is paid in torn audio on the far side of a freeze.
+	 */
 	return ksceUsbdIsochronousTransfer(
 		pipe,
 		(ksceUsbdIsochTransfer *)(void *)&context->transfer,
@@ -834,30 +876,19 @@ static int wait_for_free_context(StreamContext **out)
 	}
 }
 
-static int pcm_copy(uint32_t sequence, uint32_t offset, uint8_t *packet)
+/*
+ * The seqlock is gone with the copy, and it could not have survived it.  Its
+ * guarantee was that the bytes we took were whole at the moment we took them,
+ * which needed a read to bracket; the controller's read happens later and
+ * elsewhere, so there is nothing left to bracket.  What remains is a claim
+ * check: the slot still belongs to the sequence we mean to send, so it has been
+ * published and not yet reclaimed.  That is a weaker statement and is meant to
+ * be read as one.
+ */
+static int pcm_claimed(uint32_t sequence)
 {
-	uint32_t *guard = &src.guard[sequence & PCM_SLICE_MASK];
-	uint32_t expected = sequence << 1;
-	uint32_t attempt;
-
-	for (attempt = 0; attempt < 3u; ++attempt) {
-		if (__atomic_load_n(guard, __ATOMIC_ACQUIRE) != expected)
-			continue;
-		memcpy(packet, slice(sequence) + offset * 4u, PACKET_BYTES);
-		/*
-		 * Fence first, then a relaxed read -- not an acquire load.
-		 * Acquire orders what comes after it; what has to be ordered
-		 * here is the memcpy above, which must be complete before the
-		 * guard is sampled again.  An acquire load puts its barrier on
-		 * the far side and leaves the copy free to be reordered past
-		 * the check, which is how a torn read passes validation.  This
-		 * is the read_seqretry() half of the pattern.
-		 */
-		__atomic_thread_fence(__ATOMIC_ACQUIRE);
-		if (__atomic_load_n(guard, __ATOMIC_RELAXED) == expected)
-			return 1;
-	}
-	return 0;
+	return __atomic_load_n(&src.guard[sequence & PCM_SLICE_MASK],
+		__ATOMIC_ACQUIRE) == sequence << 1;
 }
 
 /* Step back one on the 1..UINT32_MAX ring, which skips zero. */
@@ -903,7 +934,7 @@ static int pcm_pin(void)
 }
 
 /* Return zero for a packet, one when no packet is ready. */
-static int pcm_next(uint8_t packet[PACKET_BYTES])
+static int pcm_next(const void **packet)
 {
 	/*
 	 * Priming.  uac1 has already selected the alternate setting, so the device
@@ -917,7 +948,7 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	 * zero once a slice is complete.
 	 */
 	if (cur.offset == 0u && !pcm_pin()) {
-		memset(packet, 0, PACKET_BYTES);
+		*packet = pcm_silence;
 		return 0;
 	}
 
@@ -925,15 +956,16 @@ static int pcm_next(uint8_t packet[PACKET_BYTES])
 	 * Rewind to the slice boundary so the next call re-pins.  Retrying the
 	 * same slice cannot work: the guard only fails once the producer has
 	 * reclaimed the slot, and it will never hand that sequence back.  Holding
-	 * position at offset 48 is therefore permanent -- pcm_pin() runs only at a
+	 * position mid-slice is therefore permanent -- pcm_pin() runs only at a
 	 * boundary, so the cursor could never reach one again, and the stream goes
 	 * quiet for the rest of the session with nothing but pcm waits to show it.
 	 */
-	if (!pcm_copy(cur.sequence, cur.offset, packet)) {
+	if (!pcm_claimed(cur.sequence)) {
 		cur.offset = 0;
 		return 1;
 	}
 
+	*packet = slice(cur.sequence) + cur.offset * 4u;
 	cur.offset += PACKET_FRAMES;
 	if (cur.offset == UAC_STREAM_CAPTURE_FRAMES)
 		cur.offset = 0;
@@ -964,16 +996,24 @@ static void pcm_wait(void)
 static int queue_next_source_packet(void)
 {
 	StreamContext *context;
+	const void *packet;
 	uint32_t sequence;
 
 	if (!wait_for_free_context(&context))
 		return 0;
 
-	if (pcm_next(context->buffer) != 0) {
+	if (pcm_next(&packet) != 0) {
 		__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
 		publish_free_context();
 		return 1;
 	}
+
+	/*
+	 * The whole of staging, now: the controller is pointed at Sony's slice and
+	 * reads it where it lies.  Which also means the bytes are not ours and stay
+	 * live until the transfer completes -- see the note on submit_context().
+	 */
+	context->transfer.buffer_base = (void *)(uintptr_t)packet;
 
 	/* One writer, so a plain increment is enough; the release store below is
 	 * what publishes the new sequence to claim_oldest_ready(). */
@@ -1144,7 +1184,7 @@ int uac_stream_start(int pipe_id)
 		StreamContext *context = &contexts[index];
 
 		context->callback_token = generation | index;
-		context->transfer.buffer_base = context->buffer;
+		context->transfer.buffer_base = (void *)(uintptr_t)pcm_silence;
 		context->transfer.num_packets = 1u;
 		__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
 	}
