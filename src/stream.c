@@ -86,7 +86,7 @@
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
-#define PCM_QUEUE_FLOOR 5u
+#define PCM_QUEUE_FLOOR 6u
 #define PCM_QUEUE_TARGET (PACKETS_PER_BLOCK + PCM_QUEUE_FLOOR)
 #define PCM_QUEUE_MAX \
 	((UAC_STREAM_SLICE_COUNT - 1u) * PACKETS_PER_BLOCK - MAX_IN_FLIGHT)
@@ -200,8 +200,24 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
  * least that is even coherent; half a block is the least that is comfortable.
  */
 STATIC_ASSERT(PCM_QUEUE_FLOOR >= 1u, queue_floor_must_be_a_margin);
-STATIC_ASSERT(PCM_QUEUE_TARGET < PCM_QUEUE_MAX,
-	queue_target_must_leave_headroom_below_the_cut);
+/*
+ * Equality is allowed, and measured clean.  The peak sits on the cut but the
+ * test is strictly greater, so resting there is stable: takes observe 10, 9, 8,
+ * 7 and the publication puts it back to 10.  A cut needs a publication to land
+ * after three takes rather than four, which is the phase between the two clocks
+ * crossing a take boundary -- and that phase moves at the clock error, measured
+ * at about two ppm, so it crosses once every several minutes rather than once a
+ * block.  Treating the phase as random per block is what made this look fatal.
+ *
+ * What equality does spend is the reclaim budget: the deepest entry is MAX - 1
+ * from the wire plus the requests USBD holds, which lands exactly on (COUNT - 1)
+ * block periods.  That figure is inferred from ram_submit() returning only once
+ * the engine has finished the previous block, and nothing measures it directly.
+ * This setting is therefore the test of it, and a wrong answer is the silent
+ * kind -- a slice read while it is being rewritten moves no counter here.
+ */
+STATIC_ASSERT(PCM_QUEUE_TARGET <= PCM_QUEUE_MAX,
+	queue_target_must_not_pass_the_cut);
 STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_QUEUE_MAX &&
 	(PCM_QUEUE_SLOTS & PCM_QUEUE_MASK) == 0u,
 	queue_must_be_a_power_of_two_deeper_than_its_bound);
