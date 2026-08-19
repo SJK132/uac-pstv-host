@@ -331,7 +331,14 @@ static int build_stream_candidate(const DeviceScan *scan,
 		SCE_USBD_ENDPOINT_TRANSFER_TYPE_ISOCHRONOUS)
 		return 0;
 
-	/* The fixed packet pump has no explicit or implicit feedback support. */
+	/*
+	 * The fixed packet pump has no explicit or implicit feedback support.
+	 *
+	 * Which of the two we got is worth saying out loud.  An adaptive sink
+	 * recovers its clock from the rate we deliver at; a synchronous one is
+	 * locked to the bus frame and cannot follow us at all.  That decides
+	 * whether an unfed frame is a rate signal or simply a hole.
+	 */
 	sync_type = endpoint->bmAttributes & USB_ISO_SYNC_MASK;
 	if (sync_type != USB_ISO_SYNC_ADAPTIVE &&
 	    sync_type != USB_ISO_SYNC_SYNCHRONOUS) {
@@ -339,6 +346,7 @@ static int build_stream_candidate(const DeviceScan *scan,
 			endpoint->bEndpointAddress, sync_type);
 		return 0;
 	}
+	found->synchronous = sync_type == USB_ISO_SYNC_SYNCHRONOUS;
 
 	capacity = endpoint_capacity(endpoint->wMaxPacketSize, scan->speed);
 	if (capacity == 0) {
@@ -496,11 +504,12 @@ int uac1_probe(int device_id)
 
 	uac_log(LOG_PREFIX
 		"UAC1 %04x:%04x, speed %u, if %u alt %u, ep 0x%02x, "
-		"interval %u, max %u, stream %u, freq_ctl %u\n",
+		"interval %u, max %u, stream %u, freq_ctl %u, sync %s\n",
 		device->idVendor, device->idProduct, found.speed,
 		found.interface_number, found.alternate_setting,
 		found.endpoint_address, found.interval, found.max_packet_size,
-		TARGET_PACKET_BYTES, found.frequency_control);
+		TARGET_PACKET_BYTES, found.frequency_control,
+		found.synchronous ? "synchronous" : "adaptive");
 	return SCE_USBD_PROBE_SUCCEEDED;
 }
 

@@ -83,7 +83,7 @@
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
-#define PCM_QUEUE_FLOOR 2u
+#define PCM_QUEUE_FLOOR 4u
 #define PCM_QUEUE_TARGET (PACKETS_PER_BLOCK + PCM_QUEUE_FLOOR)
 #define PCM_QUEUE_MAX \
 	((UAC_STREAM_SLICE_COUNT - 1u) * PACKETS_PER_BLOCK - MAX_IN_FLIGHT)
@@ -183,12 +183,13 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	slice_count_must_be_a_power_of_two_above_three);
 /*
  * The floor has to be a real margin, and the working peak has to sit below the
- * cut with room to spare -- a TARGET close to MAX cuts on ordinary jitter, which
- * is a slip manufactured out of nothing, the same mistake the sampled cursor
- * made.  Half a block of headroom is the least that means anything.
+ * cut.  How far below is the thing being traded: the closer TARGET runs to MAX,
+ * the more ordinary jitter trips the cut and turns into a slip manufactured out
+ * of nothing, which is the mistake the sampled cursor made.  One packet is the
+ * least that is even coherent; half a block is the least that is comfortable.
  */
 STATIC_ASSERT(PCM_QUEUE_FLOOR >= 1u, queue_floor_must_be_a_margin);
-STATIC_ASSERT(PCM_QUEUE_TARGET + PACKETS_PER_BLOCK / 2u <= PCM_QUEUE_MAX,
+STATIC_ASSERT(PCM_QUEUE_TARGET < PCM_QUEUE_MAX,
 	queue_target_must_leave_headroom_below_the_cut);
 STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_QUEUE_MAX &&
 	(PCM_QUEUE_SLOTS & PCM_QUEUE_MASK) == 0u,
@@ -368,6 +369,9 @@ typedef struct {
 typedef struct {
 	uint32_t tail;
 	uint32_t write_sequence;
+	/* What went out last, so a frame the producer has not filled can be fed
+	 * something rather than nothing. */
+	const uint8_t *last;
 	int valid;
 } __attribute__((aligned(UAC_ERG))) PcmCursor;
 
@@ -970,7 +974,30 @@ static int pcm_next(const void **packet)
 		cur.tail = head - PCM_QUEUE_TARGET;
 		cur.valid = 1;
 	}
-	return pcm_take(packet);
+
+	/*
+	 * Every frame gets a packet, even the ones the producer has not filled.
+	 *
+	 * Leaving a frame empty was meant as a rate signal: an adaptive sink
+	 * recovers its clock from how much data arrives, so under-feeding it
+	 * should tell it to slow down.  What that ignores is how such a sink
+	 * recovers -- a slow, lightly damped loop that reads an irregular arrival
+	 * rate as something to chase.  The result is not a click at the gap but a
+	 * clock that wanders, which lands on every sample and stays wrong while
+	 * the hunting lasts.  A recording of the bad state has exactly that shape:
+	 * broadband roughness with no damage at any buffer boundary.
+	 *
+	 * So hold the rate steady at one packet per frame and absorb the mismatch
+	 * here instead.  Repeating the last packet costs a millisecond of stutter,
+	 * which is audible once rather than for as long as the clock takes to
+	 * settle, and it keeps the count of how often it happened.
+	 */
+	if (pcm_take(packet) != 0) {
+		COUNT_PCM_WAIT();
+		*packet = cur.last;
+	}
+	cur.last = *packet;
+	return 0;
 }
 
 static void pcm_wait(void)

@@ -14,6 +14,10 @@ typedef struct {
 	uint8_t interval;
 	uint8_t speed;
 	uint8_t frequency_control;
+	/* Locked to the bus frame rather than recovering its clock from the rate
+	 * we deliver at, so an unfed frame is a hole it must conceal and not a
+	 * rate it can follow. */
+	uint8_t synchronous;
 	uint16_t max_packet_size;
 	SceUsbdEndpointDescriptor *endpoint;
 } Uac1Stream;
