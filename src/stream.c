@@ -67,7 +67,7 @@
  * itself, because a slice torn this way was marked complete a block ago, is not
  * reclaimed for another seven, and passes the seqlock intact.
  */
-#define PCM_TRAIL 4u
+#define PCM_TRAIL 1u
 /*
  * Transport depth: three requests owned by USBD and one READY context.  The
  * fourth lets the feeder prepare the next millisecond without touching
