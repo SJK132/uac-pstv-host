@@ -78,9 +78,7 @@ static volatile int worker_result;
 static volatile uint32_t physical_stop_count;
 /*
  * Sony's entries into our start hook, per session.  Acquisition accounts for
- * one.  A second means AVConfig re-entered send_start during teardown, which is
- * the case the accept_start handshake in start_capture() exists for; if it is
- * always 1, that handshake reduces to the worker_state CAS beside it.
+ * one; a second means AVConfig re-entered send_start during teardown.
  */
 static volatile uint32_t send_start_count;
 #endif

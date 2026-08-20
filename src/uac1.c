@@ -3,9 +3,8 @@
  *
  * Everything here is either a pure function of a device's descriptors or a
  * callback that posts one command to the session thread and returns.  Callbacks
- * run on USBD's own thread and must not block, which used to shape this whole
- * file; now it costs nothing, because the work they ask for happens in
- * session.c on a thread that is allowed to take its time.
+ * run on USBD's own thread and must not block, but they only post and return --
+ * the work happens on session.c's thread, which is allowed to take its time.
  *
  * The descriptor walk is the part to be careful with.  It reads memory USBD
  * owns, so every step is bounded by the enclosing descriptor's declared length

@@ -18,18 +18,16 @@
 
 /*
  * Staging is AVConfig's own 0x1000 RAM-output region, cut into slices Sony's
- * engine fills directly.  Two slices are always spoken for -- the one in the
- * mailbox and the one claimed next -- so the cursor may trail by at most
- * COUNT - 3, which at four slices is one.  Trail zero and one both measure
- * clean, so that ceiling is not the constraint it looked like.
+ * engine fills directly.  A finished block is handed to the transport queue as
+ * whole packets, so the queue depth -- not a cursor -- is the only state
+ * between producer and feeder.
  *
  * The stride is not the block size.  Sony's DMA rounds its write up to a
  * 256-byte multiple, so a slice has to hold the rounded figure or it spills
- * into the next one -- which is audible as distortion rather than a click,
- * because the corruption is continuous.  768 needs no rounding and still
- * distorted, so the stride is 1024: four of them fill the region exactly and
- * leave 256 bytes of headroom behind each block for a write that runs long.
- * stream.c asserts it; resolver.c asserts that the region holds them all.
+ * into the next one -- audible as distortion rather than a click, because the
+ * corruption is continuous.  The block is 768 bytes, which rounds to 1024, so
+ * the stride is 1024: four of them fill the region exactly.  stream.c asserts
+ * the geometry; resolver.c asserts the region holds all four.
  */
 #define UAC_STREAM_SLICE_BYTES 0x400u
 #define UAC_STREAM_SLICE_COUNT 4u
