@@ -5,7 +5,7 @@
  *
  *   - the source side is Sony's own audio engine, writing captured PCM into
  *     slices of AVConfig's RAM-output region and handing each finished block
- *     to a queue as four 1 ms packets;
+ *     to a queue as five 1 ms packets;
  *   - the transport side runs one feeder thread that drains that queue a packet
  *     per frame, pointing the host controller straight at the slice.
  *
@@ -48,11 +48,10 @@
 /*
  * The producer is the clock.
  *
- * There is no cursor and no trail.  Sony completes one block every four
- * milliseconds and is steadier at it than anything on this side, so the capture
- * worker enqueues that block's packets as it finishes them and the transport
- * drains the queue one per frame.  Nothing samples anything, so there is no
- * phase to get wrong and no distance to tune.
+ * Sony completes one block every five milliseconds and is steadier at it than
+ * anything on this side, so the capture worker enqueues that block's packets as
+ * it finishes them and the transport drains the queue one per frame.  Nothing
+ * samples a position, so there is no phase to get wrong.
  *
  * The device can follow.  uac1.c accepts only adaptive and synchronous
  * endpoints, and an adaptive sink locks its clock to the rate it is fed, so
@@ -61,51 +60,42 @@
  * which is the correct signal rather than a defect to conceal by repeating or
  * dropping a block.
  *
- * The depth cannot hold still.  A block arrives whole and leaves a packet at a
- * time, so it swings by PACKETS_PER_BLOCK every period no matter what, and the
- * only choice is where that swing sits.  FLOOR is the bottom of it and is the
- * entire margin against the producer being late: at zero, a publication and a
- * take land on the same instant every block and either order is a coin flip, so
- * the trough is what has to be bought rather than the average.
+ * The rule, in one sentence: when a block finishes, read the block
+ * PCM_TRAIL_BLOCKS behind it, from its start.
  *
- * TARGET is the top, one block above the floor, so the queue averages exactly
- * one block of trail -- the transport is sending block N while Sony writes N+1.
- * It is both where draining begins and where an overrun is cut back to, so the
- * queue lands on the same depth however it got there.  FLOOR is the only knob:
- * every unit of it is a millisecond of latency bought with a millisecond of
- * tolerance for the producer arriving late.
+ * So with a trail of two, the engine finishing block A puts the reader at the
+ * start of the block two before it, and finishing B moves it on by one block
+ * again.  The reader works forward through that block over the period, which is
+ * exactly how long the block lasts, so it arrives at the end just as the next
+ * publication moves it on.
  *
- * MAX bounds how long an entry may wait, because it points into a slice and has
- * to reach the wire before Sony writes that slice again.  It is kept at
- * (COUNT - 1) block periods less the requests USBD holds, which is stricter than
- * it needs to be and deliberately so.
+ * PCM_READ_BACK is that rule counted in packets, and it is one block more than
+ * the trail rather than equal to it: reaching the START of the block two back
+ * means spanning that block and the two newer ones.  Naming which block to read
+ * and measuring how far back its first packet lies are different things, and the
+ * second is the one the queue arithmetic needs.
  *
- * That figure was derived on the assumption that the engine writes a block
- * across its whole period, making a slice unsafe from the moment it is reclaimed.
- * Walking the floor up disproves it: at six the deepest read lands exactly on
- * the bound, at eight two past it, at ten a full rotation of the ring past it,
- * and all three play clean.  So the engine empties a buffer in a burst and then
- * idles -- which is also why the write rounds to 256-byte units, and why reading
- * a block the mailbox had only just released was safe back when there was a
- * cursor.  The unsafe window is microseconds, not a period.
+ * One block of trail would leave the reader on the block behind the pen with
+ * nothing in hand; two gives a whole block period of slack for the producer to
+ * be late in, and by ear that is the difference between a faint hiss and
+ * silence.
  *
- * The bound stays tight anyway.  Nothing needs the room: the floor stops buying
- * anything above four, so the spare depth would be latency spent on nothing, and
- * a burst that ever did overrun its slice would tear silently -- no counter here
- * can see it.
+ * PCM_QUEUE_MAX is where an overrun is cut back to, and it rides PCM_READ_BACK
+ * so the queue lands on the same place however it got there.  It once tried to
+ * bound how long an entry may wait before Sony rewrites its slice, derived from
+ * the engine writing a block across its whole period.  Reading further and
+ * further back disproved that: a full rotation of the ring past the supposed
+ * bound still plays clean, so the engine empties a buffer in a burst and then
+ * idles.  That also explains the write rounding to 256-byte units, and why a
+ * block the mailbox had only just released was safe to read back when there was
+ * a cursor.  The unsafe window is microseconds, not a period.
  */
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
+#define PCM_TRAIL_BLOCKS 2u
+#define PCM_READ_BACK ((PCM_TRAIL_BLOCKS + 1u) * PACKETS_PER_BLOCK)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
-#define PCM_QUEUE_FLOOR 8u
-#define PCM_QUEUE_TARGET (PACKETS_PER_BLOCK + PCM_QUEUE_FLOOR)
-/*
- * The cut rides the peak.  Above floor four the old (COUNT - 1) bound is the
- * smaller of the two, and a queue resting above its own cut fires a zero-length
- * slip on every packet rather than cutting anything -- and that bound is the one
- * the floor ladder disproved, so it is the wrong thing to be limited by.
- */
-#define PCM_QUEUE_MAX PCM_QUEUE_TARGET
+#define PCM_QUEUE_MAX PCM_READ_BACK
 /*
  * Three requests owned by USBD and one context idle behind them, being filled.
  *
@@ -208,34 +198,25 @@ STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
 	slice_count_must_be_a_power_of_two_above_three);
 /*
- * The floor has to be a real margin, and the working peak has to sit below the
- * cut.  How far below is the thing being traded: the closer TARGET runs to MAX,
- * the more ordinary jitter trips the cut and turns into a slip manufactured out
- * of nothing, which is the mistake the sampled cursor made.  One packet is the
- * least that is even coherent; half a block is the least that is comfortable.
+ * A trail of zero would put the reader on the block the engine is still handing
+ * over, and one leaves it on the block behind with nothing in hand for the
+ * producer to be late in.  Two is the first value with any slack, and by ear it
+ * is where the hiss stops.
  */
-STATIC_ASSERT(PCM_QUEUE_FLOOR >= 1u, queue_floor_must_be_a_margin);
+STATIC_ASSERT(PCM_TRAIL_BLOCKS >= 1u, reader_must_trail_the_engine);
 /*
- * Equality is allowed, and measured clean.  The peak sits on the cut but the
- * test is strictly greater, so resting there is stable: takes observe 10, 9, 8,
- * 7 and the publication puts it back to 10.  A cut needs a publication to land
- * after three takes rather than four, which is the phase between the two clocks
- * crossing a take boundary -- and that phase moves at the clock error, measured
- * at about two ppm, so it crosses once every several minutes rather than once a
- * block.  Treating the phase as random per block is what made this look fatal.
+ * The reader has to stay inside the ring, since an entry further back than the
+ * ring is deep has been overwritten by the producer.  Strictly greater, not
+ * equal: at equality the oldest readable entry is the one about to be written.
  *
- * What equality does spend is the reclaim budget: the deepest entry is MAX - 1
- * from the wire plus the requests USBD holds, which lands exactly on (COUNT - 1)
- * block periods.  That figure is inferred from ram_submit() returning only once
- * the engine has finished the previous block, and nothing measures it directly.
- * This setting is therefore the test of it, and a wrong answer is the silent
- * kind -- a slice read while it is being rewritten moves no counter here.
+ * Depth itself does pass this during a stall -- the feeder stops taking while
+ * the producer keeps publishing, and it reaches hundreds -- but the cut runs
+ * before every read, so what is read is always the newest PCM_READ_BACK, which
+ * are always intact.
  */
-STATIC_ASSERT(PCM_QUEUE_TARGET <= PCM_QUEUE_MAX,
-	queue_target_must_not_pass_the_cut);
-STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_QUEUE_MAX &&
+STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_READ_BACK &&
 	(PCM_QUEUE_SLOTS & PCM_QUEUE_MASK) == 0u,
-	queue_must_be_a_power_of_two_deeper_than_its_bound);
+	queue_must_be_a_power_of_two_deeper_than_the_read_back);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
@@ -1002,8 +983,8 @@ static int pcm_take(const void **packet)
 	if (depth == 0u)
 		return 1;
 	if (depth > PCM_QUEUE_MAX) {
-		COUNT_SLIP((int32_t)(depth - PCM_QUEUE_TARGET));
-		cur.tail = head - PCM_QUEUE_TARGET;
+		COUNT_SLIP((int32_t)(depth - PCM_READ_BACK));
+		cur.tail = head - PCM_READ_BACK;
 	}
 	*packet = queue.entry[cur.tail & PCM_QUEUE_MASK];
 	cur.tail++;
@@ -1028,11 +1009,11 @@ static void pcm_next(const void **packet)
 	if (!cur.valid) {
 		uint32_t head = __atomic_load_n(&queue.head, __ATOMIC_ACQUIRE);
 
-		if (head - cur.tail < PCM_QUEUE_TARGET) {
+		if (head - cur.tail < PCM_READ_BACK) {
 			*packet = pcm_silence;
 			return;
 		}
-		cur.tail = head - PCM_QUEUE_TARGET;
+		cur.tail = head - PCM_READ_BACK;
 		cur.valid = 1;
 	}
 
@@ -1152,9 +1133,10 @@ static void report_session(void)
 
 		uac_log(LOG_PREFIX
 			"  final queue: head %u tail %u depth %u valid %d "
-			"(swing %u..%u, max %u)\n",
+			"(reading %u blocks back = %u..%u packets of %u)\n",
 			head, cur.tail, head - cur.tail, cur.valid,
-			PCM_QUEUE_FLOOR, PCM_QUEUE_TARGET, PCM_QUEUE_MAX);
+			PCM_TRAIL_BLOCKS, PCM_READ_BACK - PACKETS_PER_BLOCK,
+			PCM_READ_BACK, PCM_QUEUE_SLOTS);
 	}
 	{
 		uint32_t sent = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
