@@ -63,22 +63,25 @@
  * The rule, in one sentence: when a block finishes, read the block
  * PCM_TRAIL_BLOCKS behind it, from its start.
  *
- * So with a trail of two, the engine finishing block A puts the reader at the
- * start of the block two before it, and finishing B moves it on by one block
- * again.  The reader works forward through that block over the period, which is
- * exactly how long the block lasts, so it arrives at the end just as the next
- * publication moves it on.
+ * At one, that is the rotation a triple buffer describes: the engine writing B
+ * has the reader on A, writing C has it on B, writing A has it on C.  The reader
+ * works forward through its block over the period, which is exactly how long the
+ * block lasts, so it arrives at the end just as the next publication moves it on
+ * -- and the slot it just left sits idle for a whole period before the engine
+ * returns to it.  Four slices rather than three give that rotation a spare slot,
+ * and keep the index a mask instead of a modulo.
  *
- * PCM_READ_BACK is that rule counted in packets, and it is one block more than
- * the trail rather than equal to it: reaching the START of the block two back
- * means spanning that block and the two newer ones.  Naming which block to read
+ * PCM_READ_BACK is the same rule counted in packets, and it is one block more
+ * than the trail rather than equal to it: reaching the START of the block one
+ * back means spanning that block and the newer one.  Naming which block to read
  * and measuring how far back its first packet lies are different things, and the
- * second is the one the queue arithmetic needs.
+ * second is what the queue arithmetic needs.
  *
- * One block of trail would leave the reader on the block behind the pen with
- * nothing in hand; two gives a whole block period of slack for the producer to
- * be late in, and by ear that is the difference between a faint hiss and
- * silence.
+ * The slack this leaves the producer to be late in is the trail times the block,
+ * so it is the block length that decides whether one is enough.  At 96 frames
+ * one block is 2 ms and hisses; at 240 it is 5 ms and does not.  Two blocks
+ * measured no better than one at this size, which is what carrying 10 ms of
+ * slack against a threshold nearer 4 would predict.
  *
  * PCM_QUEUE_MAX is where an overrun is cut back to, and it rides PCM_READ_BACK
  * so the queue lands on the same place however it got there.  It once tried to
@@ -91,7 +94,7 @@
  * a cursor.  The unsafe window is microseconds, not a period.
  */
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
-#define PCM_TRAIL_BLOCKS 2u
+#define PCM_TRAIL_BLOCKS 1u
 #define PCM_READ_BACK ((PCM_TRAIL_BLOCKS + 1u) * PACKETS_PER_BLOCK)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
@@ -217,6 +220,25 @@ STATIC_ASSERT(PCM_TRAIL_BLOCKS >= 1u, reader_must_trail_the_engine);
 STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_READ_BACK &&
 	(PCM_QUEUE_SLOTS & PCM_QUEUE_MASK) == 0u,
 	queue_must_be_a_power_of_two_deeper_than_the_read_back);
+/*
+ * How long a slice must survive after publication, and the one number here that
+ * is measured rather than derived.
+ *
+ * An entry points into Sony's memory, so the engine must not write that slice
+ * again before the controller has read it -- and the controller reads it at the
+ * far end of both waits, the queue and the schedule.  Nothing on this side can
+ * observe when the engine comes back to a slice; the only evidence is reading
+ * further and further back and listening.  Sixteen packets played clean at
+ * 192 x 4, so sixteen is demonstrated.  Nothing establishes anything past it.
+ *
+ * Kept as an assertion rather than a comment because the failure has no symptom
+ * a counter can catch: a slice read while the engine rewrites it passes the
+ * queue, passes the transfer and sounds like a dirty edge.  A geometry that
+ * walks past the evidence should stop the build, not the ear.
+ */
+#define PCM_PROVEN_READ_DEPTH 16u
+STATIC_ASSERT(PCM_READ_BACK + MAX_IN_FLIGHT <= PCM_PROVEN_READ_DEPTH,
+	read_depth_must_stay_inside_what_has_been_measured);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
 	slice_stride_must_tile_lines);
