@@ -97,22 +97,26 @@
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
-#define PCM_QUEUE_FLOOR 6u
+#define PCM_QUEUE_FLOOR 8u
 #define PCM_QUEUE_TARGET (PACKETS_PER_BLOCK + PCM_QUEUE_FLOOR)
-#define PCM_QUEUE_MAX \
-	((UAC_STREAM_SLICE_COUNT - 1u) * PACKETS_PER_BLOCK - MAX_IN_FLIGHT)
 /*
- * Transport depth, and it comes out of the same budget the queue does: a packet
- * held by USBD is a packet not yet on the wire, so every request in flight is a
- * millisecond the queue may not use.
+ * The cut rides the peak.  Above floor four the old (COUNT - 1) bound is the
+ * smaller of the two, and a queue resting above its own cut fires a zero-length
+ * slip on every packet rather than cutting anything -- and that bound is the one
+ * the floor ladder disproved, so it is the wrong thing to be limited by.
+ */
+#define PCM_QUEUE_MAX PCM_QUEUE_TARGET
+/*
+ * Three requests owned by USBD and one context idle behind them, being filled.
  *
- * Two rather than three, because the evidence says which side needs it.  The
- * feeder has never once been late -- no starves across better than four hundred
- * thousand packets -- while the producer margin is audible the moment it is
- * short.  So one millisecond moves from the schedule to the floor.
+ * Depth was traded down to two while the reclaim bound looked binding, since
+ * every request in flight is a millisecond the queue could not use.  The ladder
+ * showed the bound was out by a whole ring rotation, so the trade bought nothing
+ * and the third request comes back: it is a frame more of schedule ahead of the
+ * controller, for room that was never scarce.
  */
 #define CONTEXT_COUNT 4u
-#define MAX_IN_FLIGHT 2u
+#define MAX_IN_FLIGHT 3u
 
 /*
  * USBD may deliver a completion after its pipe has been closed and the static
