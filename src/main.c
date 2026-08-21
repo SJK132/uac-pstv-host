@@ -4,8 +4,8 @@
  * Start order is dependency order -- stream, then the session thread, then the
  * USB driver -- and stop reverses it, so nothing can ever be called back into
  * after it has been torn down.  audio_tap deliberately does not appear in that
- * sequence: it is owned by the feeder thread and lives exactly as long as one
- * USB session.
+ * sequence: it belongs to the transport and lives exactly as long as one USB
+ * session.
  */
 
 #include "audio_tap.h"

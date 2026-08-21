@@ -215,7 +215,7 @@ static void close_session(void)
 		return;
 
 	uac_stream_stop();
-	/* After the feeder is gone, so nothing is still reading captured PCM. */
+	/* After the transport has stopped, so nothing still reads captured PCM. */
 	result = audio_tap_end();
 	if (result < 0)
 		uac_log(LOG_PREFIX "virtual Sony DataSend stop failed: 0x%08x\n",

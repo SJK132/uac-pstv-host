@@ -49,55 +49,14 @@
 #define SONY_ISO_PACKET_SLOTS 8u
 #define PCM_SLICE_MASK (UAC_STREAM_SLICE_COUNT - 1u)
 /*
- * The producer is the clock.
+ * When a block finishes, read the block PCM_TRAIL_BLOCKS behind it, from its
+ * start.  PCM_READ_BACK is that distance in packets, and it is one block more
+ * than the trail: reaching the start of the block one back means spanning that
+ * block and the newer one.
  *
- * Sony completes one block every five milliseconds and is steadier at it than
- * anything on this side, so the capture worker enqueues that block's packets as
- * it finishes them and the transport drains the queue one per frame.  Nothing
- * samples a position, so there is no phase to get wrong.
- *
- * The device can follow.  uac1.c accepts only adaptive and synchronous
- * endpoints, and an adaptive sink locks its clock to the rate it is fed, so
- * sending exactly what Sony produces is not an approximation of rate matching --
- * it is the thing itself.  A frame we cannot fill tells the device to slow down,
- * which is the correct signal rather than a defect to conceal by repeating or
- * dropping a block.
- *
- * The rule, in one sentence: when a block finishes, read the block
- * PCM_TRAIL_BLOCKS behind it, from its start.
- *
- * At one, that is the rotation a triple buffer describes: the engine writing B
- * has the reader on A, writing C has it on B, writing A has it on C.  The reader
- * works forward through its block over the period, which is exactly how long the
- * block lasts, so it arrives at the end just as the next publication moves it on
- * -- and the slot it just left sits idle for a whole period before the engine
- * returns to it.  Four slices rather than three give that rotation a spare slot,
- * and keep the index a mask instead of a modulo.
- *
- * PCM_READ_BACK is the same rule counted in packets, and it is one block more
- * than the trail rather than equal to it: reaching the START of the block one
- * back means spanning that block and the newer one.  Naming which block to read
- * and measuring how far back its first packet lies are different things, and the
- * second is what the queue arithmetic needs.
- *
- * Two is where this sits, and it is left there rather than argued down.  One
- * desynchronised while the controller read Sony's slice directly, and no account
- * of the slack explained it -- a trail of one at this block size is 5 ms, more
- * than the 4 ms that ran clean for seven minutes at 192 frames.  Every distance
- * that misbehaved did so with no copy in the path, and every distance tried with
- * one, down to a single block, was clean.  So the copy is very likely what fixed
- * it and one would very likely work again; try that before assuming this has to
- * be two.
- *
- * PCM_QUEUE_MAX is where an overrun is cut back to, and it rides PCM_READ_BACK
- * so the queue lands on the same place however it got there.  It once tried to
- * bound how long an entry may wait before Sony rewrites its slice, derived from
- * the engine writing a block across its whole period.  Reading further and
- * further back disproved that: a full rotation of the ring past the supposed
- * bound still plays clean, so the engine empties a buffer in a burst and then
- * idles.  That also explains the write rounding to 256-byte units, and why a
- * block the mailbox had only just released was safe to read back when there was
- * a cursor.  The unsafe window is microseconds, not a period.
+ * Two is measured, not derived.  One desynchronised at this block size, which
+ * no account of the producer's slack predicts, so lower it only on hardware.
+ * PCM_QUEUE_MAX rides PCM_READ_BACK so an overrun lands where priming does.
  */
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
 #define PCM_TRAIL_BLOCKS 2u
@@ -105,15 +64,8 @@
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
 #define PCM_QUEUE_MAX PCM_READ_BACK
-/*
- * Three requests owned by USBD and one context idle behind them, being filled.
- *
- * Depth was traded down to two while the reclaim bound looked binding, since
- * every request in flight is a millisecond the queue could not use.  The ladder
- * showed the bound was out by a whole ring rotation, so the trade bought nothing
- * and the third request comes back: it is a frame more of schedule ahead of the
- * controller, for room that was never scarce.
- */
+/* Three requests owned by USBD, and a fourth context so the token index stays a
+ * two-bit mask. */
 #define CONTEXT_COUNT 4u
 #define MAX_IN_FLIGHT 3u
 
@@ -159,21 +111,16 @@ STATIC_ASSERT(UAC_ERG != 0u && (UAC_ERG & (UAC_ERG - 1u)) == 0u,
 
 /*
  * Sony's DMA writes past the block, to the next 256-byte multiple STRICTLY
- * greater than it -- never to the block itself, even when the block is already a
- * multiple.  Three geometries agree: 384 bytes writes 512, 576 writes 768 (a
- * 576-byte stride spilled exactly 192 into its neighbour), and 768 writes 1024
- * (a 768-byte stride distorted; 1024 plays clean).
- *
- * A ceiling rounding models the first two and gets the third wrong, which is how
- * a 768-in-768 arrangement passed this assertion and reached hardware.  Divide
- * and add one instead, so a block that lands on a boundary still claims the next
- * one.  Corruption here is continuous rather than a click, because it lands in
- * every block.
+ * greater than it -- never to the block itself, even when the block is already
+ * a multiple.  Measured: 384 bytes writes 512, 576 writes 768, 768 writes 1024.
+ * A ceiling rounding fits the first two and lets 768-in-768 through, which is
+ * continuous distortion rather than a click because it lands in every block.
  */
 #define DMA_WRITE_ROUND 256u
 #define DMA_WRITE_SIZE(bytes) \
 	(((bytes) / DMA_WRITE_ROUND + 1u) * DMA_WRITE_ROUND)
-STATIC_ASSERT(UAC_STREAM_SLICE_BYTES >= DMA_WRITE_SIZE(UAC_STREAM_CAPTURE_BYTES),
+STATIC_ASSERT(
+	UAC_STREAM_SLICE_BYTES >= DMA_WRITE_SIZE(UAC_STREAM_CAPTURE_BYTES),
 	slice_must_hold_the_rounded_up_dma_write);
 STATIC_ASSERT(UAC_STREAM_SLICE_COUNT > 3u &&
 	(UAC_STREAM_SLICE_COUNT & PCM_SLICE_MASK) == 0u,
@@ -199,24 +146,13 @@ STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_READ_BACK &&
 	(PCM_QUEUE_SLOTS & PCM_QUEUE_MASK) == 0u,
 	queue_must_be_a_power_of_two_deeper_than_the_read_back);
 /*
- * How long a slice must survive after publication, and the one number here that
- * is measured rather than derived.
+ * How long a slice must survive after publication -- the one figure here that
+ * is measured rather than derived, since nothing on this side can observe when
+ * the engine comes back to a slice.  18 packets played clean at this geometry.
  *
- * The engine must not write a slice again before the packets have been taken
- * out of it.  The copy is what makes that a bound on the queue alone:
- * the bytes are lifted at the pop, so the requests USBD is holding no longer
- * extend the window the way they did when the controller read the slice itself.
- *
- * Nothing on this side can observe when the engine comes back to a slice.  The
- * only evidence is reading further and further back and listening, and 18
- * packets from publication to the wire played clean at this geometry, so the
- * queue's 15 is well inside it.  The figure moves only when someone plays the
- * thing and reports back.
- *
- * An assertion rather than a comment because the failure has no symptom a
- * counter can catch: a slice read while the engine rewrites it passes the queue,
- * passes the transfer and sounds like a dirty edge.  A geometry that walks past
- * the evidence should stop the build, not the ear.
+ * An assertion because the failure is silent: a slice read while the engine
+ * rewrites it passes the queue, passes the transfer, and only sounds wrong.  A
+ * geometry past the evidence should stop the build rather than the ear.
  */
 #define PCM_PROVEN_READ_DEPTH 18u
 STATIC_ASSERT(PCM_READ_BACK <= PCM_PROVEN_READ_DEPTH,
@@ -232,11 +168,6 @@ enum {
 	STREAM_STOPPING,
 };
 
-/*
- * IN_FLIGHT exists because READY cannot mean two things at once.  With several
- * requests outstanding, READY must stay distinct from a buffer USBD still owns,
- * or DMA storage can be submitted twice.
- */
 /* Native SceUsbAudio isoch request ABI on the reversed PSTV firmware. */
 typedef struct {
 	uint16_t len;
@@ -259,18 +190,12 @@ STATIC_ASSERT(offsetof(SonyIsoTransfer, packets) == 0x08u,
 #endif
 
 /*
- * A context no longer carries a buffer.  The host controller reads Sony's slice
- * where it lies, so what used to be staging storage is now just a pointer set
- * per submit, and CONTEXT_ALIGN is only keeping each context's state word out of
- * its neighbour's reservation granule.
- */
-/*
  * CONTEXT_ALIGN is a DMA constraint, not a cache one.  buffer[] is the only
  * storage the host controller reads, and EHCI addresses a transfer buffer as a
- * page plus an offset, so one straddling a 4 KiB boundary needs the descriptor's
- * second page pointer programmed too.  Aligning each context to a divisor of the
- * page size, buffer first and no larger than that alignment, keeps every buffer
- * inside one page by construction.
+ * page plus an offset, so one straddling a 4 KiB boundary needs the
+ * descriptor's second page pointer programmed too.  Aligning each context to a
+ * divisor of the page size, buffer first and no larger than that alignment,
+ * keeps every buffer inside one page by construction.
  */
 #define CONTEXT_ALIGN 256u
 
@@ -285,7 +210,7 @@ STATIC_ASSERT(sizeof(StreamContext) == CONTEXT_ALIGN,
 STATIC_ASSERT(PACKET_BYTES <= CONTEXT_ALIGN, context_buffer_must_fit_one_block);
 STATIC_ASSERT(4096u % CONTEXT_ALIGN == 0u, context_blocks_must_tile_a_page);
 
-/* Packets have to tile a slice for the copy to take one without spanning two. */
+/* Packets tile a slice, so a copy never spans two. */
 STATIC_ASSERT(UAC_STREAM_CAPTURE_BYTES % PACKET_BYTES == 0u,
 	packets_must_tile_a_slice);
 
@@ -349,15 +274,9 @@ typedef struct {
 
 /*
  * The handoff.  One producer, the capture worker, appending whole blocks; one
- * consumer, the completion callback, taking a packet at a time.  head is the only shared
- * word -- entries are pointer-sized and aligned, so a reader either sees the
- * old one or the new one -- and publishing head after the entries is what makes
- * a block visible only once all of it is written.
- *
- * This is what the guard words used to do.  A seqlock proved a slice was whole
- * while it was being read; queueing a block only after ram_submit() has proved
- * it complete says the same thing earlier and once, and the bound on how deep
- * the queue may run is what keeps the far end from being reclaimed underneath.
+ * consumer, the completion callback, taking a packet at a time.  head is the
+ * only shared word, and publishing it after the entries is what makes a block
+ * visible only once all of it is written.
  */
 typedef struct {
 	uint32_t head;
@@ -451,12 +370,10 @@ static int32_t slip_delta[SLIP_LOG_MAX];
 static uint32_t wait_first;
 static uint32_t wait_last;
 /*
- * The two clamps are the drift meter.  Neither clock is observable directly, but
- * every packet repeated is 48 frames delivered that Sony never made, and every
- * packet dropped is 48 frames made that were never delivered.  The running
- * difference over the packets sent is the rate error between Sony's audio clock
- * and the USB frame timer, in parts per million, which is the number this has
- * been guessing at all along.
+ * The two clamps are a drift meter: a packet repeated is 48 frames delivered
+ * that Sony never made, a packet dropped is 48 frames made and never delivered.
+ * The difference over the packets sent is the rate error between Sony's clock
+ * and the USB frame timer, in parts per million.
  */
 static uint32_t dropped_packets;
 #define FREEZE_LOG_MAX 8u
@@ -594,7 +511,8 @@ void *uac_stream_capture_claim(void)
  * Entries are written before head moves, and head is released, so a block is
  * seen either not at all or entire.  Nothing here can block or fail:
  * this runs on the capture worker between two ram_submit() calls, and Sony's
- * mailbox is one deep, so time spent here is time the engine has nothing queued.
+ * mailbox is one deep, so time spent here is time the engine has nothing
+ * queued.
  */
 void uac_stream_capture_ready(void)
 {
@@ -709,18 +627,10 @@ static int submit_context(StreamContext *context)
 /*
  * Take the next packet and hand the same context straight back to USBD.
  *
- * There is no feeder thread and no free-context handshake because a completion
- * is the only thing that ever frees a context, and it frees exactly one: the
- * one it was called for.  Filling that context in the callback and resubmitting
- * it there removes a thread wakeup, two event-flag calls and a context switch
- * from every millisecond, and the ordering falls out rather than being
- * arranged -- isochronous requests complete in the order they were queued, so
- * the context reporting in is always the oldest and the packet it takes is
- * always the next one due.
- *
- * The copy costs about fifty cycles.  The submit that follows it has been
- * measured at 260-505 us, so nothing added here is close to the dominant term,
- * and this callback was already making that call before the feeder was removed.
+ * A completion frees exactly one context -- the one it was called for -- so no
+ * thread or handshake is needed, and PCM order falls out rather than being
+ * arranged: isochronous requests complete in the order they were queued, so the
+ * context reporting in is always the oldest.
  */
 static void pcm_next(const void **packet);
 
@@ -774,15 +684,10 @@ out:
  * be read as one.
  */
 /*
- * Take the oldest queued packet, or say there is none.
- *
- * Two bounds, and they mean opposite things.  Empty is the transport having
- * outrun the producer: the frame goes unfilled, which on an adaptive endpoint is
- * how the device is told its clock is fast, so it is a wait rather than an error
- * and nothing is invented to fill it.  Past MAX is the producer having outrun
- * the transport far enough that the oldest entries point into a slice about to
- * be reclaimed, so the queue is cut back to LEAD and the packets in between are
- * gone -- audible, counted, and the only place a discontinuity can enter.
+ * Take the oldest queued packet, or report empty.  Past MAX the producer has
+ * run far enough ahead that the oldest entries point into a slice about to be
+ * reclaimed, so the queue is cut back and the packets between are dropped --
+ * audible, counted, and the only place a discontinuity can enter.
  */
 static int pcm_take(const void **packet)
 {
@@ -809,11 +714,9 @@ static void pcm_next(const void **packet)
 	 * isochronous endpoint reads as an invalid stream to the device, while
 	 * continuous silence lets it lock cleanly and audio simply fades in.
 	 *
-	 * Starting lands the queue on TARGET rather than merely past it.  Blocks
-	 * arrive whole, so the first depth to clear the threshold overshoots it,
-	 * and beginning there would fix the swing one block higher than asked for
-	 * and keep it there all session.  Dropping to TARGET costs the packets in
-	 * between, which are the oldest audio of a stream that has not started.
+	 * Starting lands on PCM_READ_BACK rather than merely past it: blocks arrive
+	 * whole, so the first depth to clear it overshoots, and beginning there
+	 * would hold the queue a block deeper for the whole session.
 	 */
 	if (!cur.valid) {
 		uint32_t head = __atomic_load_n(&queue.head, __ATOMIC_ACQUIRE);
@@ -827,21 +730,11 @@ static void pcm_next(const void **packet)
 	}
 
 	/*
-	 * Every frame gets a packet, even the ones the producer has not filled.
-	 *
-	 * Leaving a frame empty was meant as a rate signal: an adaptive sink
-	 * recovers its clock from how much data arrives, so under-feeding it
-	 * should tell it to slow down.  What that ignores is how such a sink
-	 * recovers -- a slow, lightly damped loop that reads an irregular arrival
-	 * rate as something to chase.  The result is not a click at the gap but a
-	 * clock that wanders, which lands on every sample and stays wrong while
-	 * the hunting lasts.  A recording of the bad state has exactly that shape:
-	 * broadband roughness with no damage at any buffer boundary.
-	 *
-	 * So hold the rate steady at one packet per frame and absorb the mismatch
-	 * here instead.  Repeating the last packet costs a millisecond of stutter,
-	 * which is audible once rather than for as long as the clock takes to
-	 * settle, and it keeps the count of how often it happened.
+	 * Every frame gets a packet, even one the producer has not filled.  Leaving
+	 * it empty under-feeds the device, and a sink recovering its clock from the
+	 * arrival rate chases that rather than settling: the damage lands on every
+	 * sample instead of at the gap.  A repeat costs a millisecond of stutter,
+	 * once, and is counted.
 	 */
 	if (pcm_take(packet) != 0) {
 		COUNT_PCM_WAIT();
@@ -984,8 +877,7 @@ int uac_stream_start(int pipe_id)
 	/*
 	 * Prime the pipe by hand, once.  Every later submit is made by the
 	 * completion of the one before it, so this is the only place a request is
-	 * queued from outside the callback, and it is the whole of what the feeder
-	 * thread used to exist for.
+	 * queued from outside a callback.
 	 */
 	for (index = 0; index < MAX_IN_FLIGHT; ++index)
 		refill_context(&contexts[index]);

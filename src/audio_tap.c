@@ -8,7 +8,7 @@
  * Sony's RAM output into stream.c's staging slices.
  *
  * The whole file lives between audio_tap_begin() and audio_tap_end().  Route
- * acquisition blocks the session thread while the feeder covers it with
+ * acquisition blocks the session thread while the transport covers it with
  * silence; release blocks on the capture worker and AVConfig convergence.
  */
 
@@ -376,7 +376,7 @@ static int begin_route(void)
 #endif
 	__atomic_store_n(&worker_result, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&stop_requested, 1, __ATOMIC_RELEASE);
-	/* Before any start hook can fire, and so before the feeder can read it. */
+	/* Before any start hook can fire, and so before anything reads it. */
 	uac_stream_capture_region(audio.capture_base);
 	*audio.route_word |= ROUTE_RAM;
 	*audio.transport_ready = 1u;
@@ -390,7 +390,7 @@ static int begin_route(void)
 
 /*
  * Wait for AVConfig to converge on our route.  Blocking is safe here: the
- * caller is the session thread, which has no deadline, and the feeder is
+ * caller is the session thread, which has no deadline, and the transport is
  * already running and covering the ~400 ms with silence.
  *
  * WORKER_RUNNING is what proves the capture side is up -- start_capture()
