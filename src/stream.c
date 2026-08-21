@@ -6,8 +6,9 @@
  *   - the source side is Sony's own audio engine, writing captured PCM into
  *     slices of AVConfig's RAM-output region and handing each finished block
  *     to a queue as five 1 ms packets;
- *   - the transport side runs one feeder thread that drains that queue a packet
- *     per frame, copying each into the context the controller will read.
+ *   - the transport side is the completion callback and nothing else: each
+ *     finished request takes the next packet, copies it into its own context
+ *     and hands the same context straight back to USBD.
  *
  * Nothing samples a position: the producer sets both the content and the pace,
  * and the queue depth is the only state between them.  Its two bounds are the
@@ -21,7 +22,9 @@
  *
  * session.c owns this file's lifecycle: uac_stream_start(), uac_stream_stop()
  * and uac_stream_pipe_closed() are called from the session thread and nowhere
- * else, so the feeder has exactly one creator and one reaper.
+ * else.  Starting primes the pipe by hand and every submit after that is made
+ * by a completion, so stopping is only a matter of refusing the next one and
+ * waiting for the outstanding requests to report in.
  */
 
 #include "stream.h"
@@ -125,35 +128,8 @@
 #define CALLBACK_CLOSING 0x80000000u
 #define CALLBACK_REFS 0x7fffffffu
 
-#define FREE_EVENT_BIT 0x00000001u
 #define STOP_POLL_US 1000u
 #define STOP_POLLS 50u
-/*
- * The feeder exits through audio_tap_end(), whose own worst case is
- * WORKER_TIMEOUT_US + STOP_SETTLE_US + ROUTE_TIMEOUT_US.  This must exceed that
- * sum or teardown returns while the feeder still owns the route and the hooks.
- */
-#define FEEDER_STOP_TIMEOUT_US 4000000u
-
-/*
- * Feeder scheduling.  0x40 is the bottom of the kernel band and a poor place
- * for a thread with a 1 ms deadline; 0x20 lifts it clear while staying below
- * the capture worker's 0x12, which must not be starved because it is the
- * producer.  Per wakeup the feeder takes a context, copies 192 bytes and blocks
- * again, so it cannot monopolise a core.
- *
- * The affinity is a cache decision rather than a scheduling one: pinned to the
- * capture worker's core (CAPTURE_CPU_MASK in audio_tap.c), a slice Sony has just
- * filled is still in L1 when the feeder copies it out.  Set against that, the two
- * threads are in each other's way -- the capture worker holds spinlocks inside
- * ram_submit() while the feeder has a 1 ms deadline -- so it is worth measuring
- * apart at some point.  Left alone because every session so far was measured on
- * it.
- */
-#define FEEDER_PRIORITY 0x20
-#define FEEDER_CPU_MASK 0x80000u
-#define FEEDER_STACK 0x3000u
-
 /*
  * UAC_ERG is the Cortex-A9 exclusive-reservation granule, which on this core is
  * also the L1 line length.  Both are 32 bytes; do not carry a 64 over from a
@@ -214,10 +190,10 @@ STATIC_ASSERT(PCM_TRAIL_BLOCKS >= 1u, reader_must_trail_the_engine);
  * ring is deep has been overwritten by the producer.  Strictly greater, not
  * equal: at equality the oldest readable entry is the one about to be written.
  *
- * Depth itself does pass this during a stall -- the feeder stops taking while
- * the producer keeps publishing, and it reaches hundreds -- but the cut runs
- * before every read, so what is read is always the newest PCM_READ_BACK, which
- * are always intact.
+ * Depth itself does pass this during a stall -- completions stop arriving so
+ * nothing is taken while the producer keeps publishing, and it reaches hundreds
+ * -- but the cut runs before every read, so what is read is always the newest
+ * PCM_READ_BACK, which are always intact.
  */
 STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_READ_BACK &&
 	(PCM_QUEUE_SLOTS & PCM_QUEUE_MASK) == 0u,
@@ -226,8 +202,8 @@ STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_READ_BACK &&
  * How long a slice must survive after publication, and the one number here that
  * is measured rather than derived.
  *
- * The engine must not write a slice again before the feeder has taken its
- * packets out of it.  The copy is what makes that a bound on the queue alone:
+ * The engine must not write a slice again before the packets have been taken
+ * out of it.  The copy is what makes that a bound on the queue alone:
  * the bytes are lifted at the pop, so the requests USBD is holding no longer
  * extend the window the way they did when the controller read the slice itself.
  *
@@ -261,13 +237,6 @@ enum {
  * requests outstanding, READY must stay distinct from a buffer USBD still owns,
  * or DMA storage can be submitted twice.
  */
-enum {
-	CONTEXT_FREE = 0,
-	CONTEXT_WRITING,
-	CONTEXT_READY,
-	CONTEXT_IN_FLIGHT,
-};
-
 /* Native SceUsbAudio isoch request ABI on the reversed PSTV firmware. */
 typedef struct {
 	uint16_t len;
@@ -309,8 +278,6 @@ typedef struct {
 	uint8_t buffer[PACKET_BYTES] __attribute__((aligned(64)));
 	SonyIsoTransfer transfer __attribute__((aligned(64)));
 	uint32_t callback_token;
-	uint32_t sequence;
-	int state;
 } StreamContext;
 
 STATIC_ASSERT(sizeof(StreamContext) == CONTEXT_ALIGN,
@@ -341,22 +308,17 @@ static StreamContext contexts[CONTEXT_COUNT]
  * closes.  New shared state goes inside one of these, not at file scope.
  */
 
-/* Read or updated by both the feeder and the USBD callback on every packet. */
+/* Written by the session thread, read by the USBD callback on every packet. */
 typedef struct {
 	int state;
 	uint32_t generation;
 	int pipe;
-	/* Requests USBD owns. Raised inside pump_ready, lowered by the completion. */
-	uint32_t in_flight;
-	/* Coalesces feeder and callback requests while admitting one pumper. */
-	uint32_t pump_requests;
-	int primed;
 } __attribute__((aligned(UAC_ERG))) TxPump;
 
 /*
  * Callback-thread private in steady state, and the reason it is not folded into
- * TxPump: sharing a granule would let the feeder's pump_requests RMW clear the
- * callback's guard reservation every millisecond.
+ * TxPump: the two are written by different threads, and sharing a granule would
+ * let a store to one clear an ldrex the other holds on the other.
  */
 typedef struct {
 	uint32_t guard;
@@ -387,7 +349,7 @@ typedef struct {
 
 /*
  * The handoff.  One producer, the capture worker, appending whole blocks; one
- * consumer, the feeder, taking a packet at a time.  head is the only shared
+ * consumer, the completion callback, taking a packet at a time.  head is the only shared
  * word -- entries are pointer-sized and aligned, so a reader either sees the
  * old one or the new one -- and publishing head after the entries is what makes
  * a block visible only once all of it is written.
@@ -406,14 +368,9 @@ typedef struct {
  * Feeder-private packetizer cursor.  The callback never reads any of it, which
  * is exactly why it must not sit next to what the callback does ldrex on.
  *
- * write_sequence is the ticket stamped on each staged packet.
- * claim_oldest_ready() submits by it rather than by slot, so PCM order survives
- * contexts completing and being reused out of slot order -- which is what a
- * fixed slot rotation gets wrong.  It also serves as the priming count.
  */
 typedef struct {
 	uint32_t tail;
-	uint32_t write_sequence;
 	/* What went out last, so a frame the producer has not filled can be fed
 	 * something rather than nothing. */
 	const uint8_t *last;
@@ -441,7 +398,7 @@ static CallbackLifetime cb;
 /* Producer state, written by audio_tap's capture worker. */
 static PcmSource src;
 static PcmQueue queue;
-/* Consumer state belongs exclusively to the feeder thread. */
+/* Consumer state, touched only by the completion callback. */
 static PcmCursor cur;
 
 /*
@@ -450,22 +407,17 @@ static PcmCursor cur;
  * Both waiters use SCE_EVENT_WAITCLEAR, which clears the entire flag rather
  * than only the matched pattern, so a shared flag lets either wake destroy the
  * other subsystem's pending wakeup.  That is unrecoverable during priming:
- * there is no transfer in flight yet to re-post FREE_EVENT_BIT, so the feeder
- * waits forever and the stream comes up silent with every setup step in the log
- * reporting success.  Use SCE_EVENT_WAITCLEAR_PAT if you ever do need to share.
  *
  * At file scope rather than grouped: none of the three has a per-packet writer,
  * so nothing here can invalidate a granule another core is holding.
  */
-static SceUID free_event = -1;
-static SceUID feeder_thread = -1;
 
 /*
  * Session instrumentation, logging builds only.
  *
  *   starve   the transport won the right to submit and found the next context
  *            unfilled, so the isochronous stream gets a hole.  Audible.
- *   pcm wait the feeder had a context but no PCM to put in it, meaning
+ *   repeat   a completion came round with no packet queued, meaning
  *            pcm_copy() found the guard in flight or the slot reclaimed.  The
  *            span says whether they are spread through the session or bunched
  *            into one stretch, which is the difference between contention and
@@ -490,7 +442,6 @@ static SceUID feeder_thread = -1;
  * separates a frozen pipe from ordinary scheduling noise.
  */
 #define FREEZE_GAP_US 50000u
-static uint32_t starve_count;
 static uint32_t submit_count;
 static uint32_t pcm_wait_count;
 static uint32_t slip_count;
@@ -511,8 +462,6 @@ static uint32_t dropped_packets;
 #define FREEZE_LOG_MAX 8u
 static uint32_t freeze_at[FREEZE_LOG_MAX];
 static uint32_t freeze_gap[FREEZE_LOG_MAX];
-static uint32_t freeze_flight[FREEZE_LOG_MAX];
-#define COUNT_STARVE() __atomic_add_fetch(&starve_count, 1u, __ATOMIC_RELAXED)
 #define COUNT_SUBMIT() __atomic_add_fetch(&submit_count, 1u, __ATOMIC_RELAXED)
 
 /*
@@ -532,7 +481,7 @@ static void record_pcm_wait(void)
 
 /*
  * Stored rather than logged inline, because uac_log() writes to the filesystem
- * and doing that from the feeder would stall it and manufacture the very
+ * and doing that from the callback would stall it and manufacture the very
  * problem being measured.
  *
  * A ring, so what survives is the last few rather than the first few.  Once
@@ -576,20 +525,10 @@ static void track_freeze(void)
 		FREEZE_LOG_MAX;
 	freeze_at[n] = __atomic_load_n(&submit_count, __ATOMIC_RELAXED);
 	freeze_gap[n] = gap;
-	/*
-	 * This runs before the completion drops its own reference, so the count
-	 * includes the request reporting in.  One means nothing else was
-	 * outstanding and the schedule had emptied behind us -- our fault, and
-	 * the feeder is where to look.  Three means the controller stopped with
-	 * a full pipe, which is its scheduling and not something this side can
-	 * reach.  It is the only field that tells the two apart.
-	 */
-	freeze_flight[n] = __atomic_load_n(&tx.in_flight, __ATOMIC_ACQUIRE);
 }
 #define TRACK_FREEZE() track_freeze()
 #define RESET_FREEZE() (cb.completion_seen = 0)
 #else
-#define COUNT_STARVE() ((void)0)
 #define COUNT_SUBMIT() ((void)0)
 #define COUNT_PCM_WAIT() ((void)0)
 #define COUNT_SLIP(dropped) ((void)0)
@@ -610,19 +549,6 @@ static uint32_t next_generation(void)
 static int stream_running(void)
 {
 	return __atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) == STREAM_RUNNING;
-}
-
-static void publish_free_context(void)
-{
-	if (free_event >= 0)
-		(void)ksceKernelSetEventFlag(free_event, FREE_EVENT_BIT);
-}
-
-/* ksceKernelClearEventFlag() takes the mask of bits to KEEP, so zero resets. */
-static void reset_event(SceUID event)
-{
-	if (event >= 0)
-		(void)ksceKernelClearEventFlag(event, 0);
 }
 
 static uint32_t next_pcm_sequence(uint32_t sequence)
@@ -665,8 +591,8 @@ void *uac_stream_capture_claim(void)
 /*
  * Append the completed block, one entry per USB frame it is worth.
  *
- * Entries are written before head moves, and head is released, so the feeder
- * sees a block either not at all or entire.  Nothing here can block or fail:
+ * Entries are written before head moves, and head is released, so a block is
+ * seen either not at all or entire.  Nothing here can block or fail:
  * this runs on the capture worker between two ram_submit() calls, and Sony's
  * mailbox is one deep, so time spent here is time the engine has nothing queued.
  */
@@ -693,15 +619,9 @@ static void finish_retire(void)
 
 	if (__atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) == STREAM_STOPPING &&
 	    __atomic_load_n(&tx.pipe, __ATOMIC_ACQUIRE) < 0 &&
-	    __atomic_load_n(&feeder_thread, __ATOMIC_ACQUIRE) < 0 &&
 	    __atomic_compare_exchange_n(&cb.guard, &expected, 0u, 0,
-		__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-		__atomic_store_n(&tx.in_flight, 0u, __ATOMIC_RELAXED);
-		__atomic_store_n(&tx.pump_requests, 0u, __ATOMIC_RELAXED);
-		__atomic_store_n(&tx.primed, 0, __ATOMIC_RELAXED);
+		__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 		__atomic_store_n(&tx.state, STREAM_IDLE, __ATOMIC_RELEASE);
-		publish_free_context();
-	}
 }
 
 static void callback_leave(void)
@@ -743,7 +663,6 @@ static void stop_stream(int result, uint16_t status)
 	}
 
 	__atomic_fetch_or(&cb.guard, CALLBACK_CLOSING, __ATOMIC_ACQ_REL);
-	publish_free_context();
 	uac1_stream_failed();
 	if (result < 0)
 		uac_log(LOG_PREFIX "transfer failed: 0x%08x\n", result);
@@ -776,8 +695,8 @@ static int submit_context(StreamContext *context)
 
 	/*
 	 * After the aborts, not before: a teardown should not pay for a flush.
-	 * The feeder wrote this buffer with the CPU, so the lines have to reach
-	 * memory before the controller reads them.
+	 * This buffer was written with the CPU, so the lines have to reach memory
+	 * before the controller reads them.
 	 */
 	ksceKernelDcacheCleanRange(context->buffer, PACKET_BYTES);
 	return ksceUsbdIsochronousTransfer(
@@ -787,102 +706,35 @@ static int submit_context(StreamContext *context)
 		(void *)(uintptr_t)context->callback_token);
 }
 
-static StreamContext *claim_oldest_ready(void)
-{
-	StreamContext *best = NULL;
-	uint32_t best_sequence = 0;
-	uint32_t index;
-	int expected;
-
-	for (index = 0; index < CONTEXT_COUNT; ++index) {
-		StreamContext *context = &contexts[index];
-
-		if (__atomic_load_n(&context->state, __ATOMIC_ACQUIRE) !=
-		    CONTEXT_READY)
-			continue;
-		/*
-		 * Wrap-safe ordering: a plain < picks the wrong packet for one
-		 * comparison once cur.write_sequence wraps, which at one packet
-		 * per millisecond is about every 50 days of continuous playback.
-		 * The signed difference stays correct across the wrap and costs
-		 * the same single subtraction.
-		 */
-		if (best == NULL ||
-		    (int32_t)(context->sequence - best_sequence) < 0) {
-			best = context;
-			best_sequence = context->sequence;
-		}
-	}
-	if (best == NULL)
-		return NULL;
-	expected = CONTEXT_READY;
-	if (!__atomic_compare_exchange_n(&best->state, &expected,
-		CONTEXT_IN_FLIGHT, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-		return NULL;
-	return best;
-}
-
 /*
- * Drain every READY context the schedule has room for.  Failures stop the
- * stream here rather than reporting upwards, so a caller only ever has to
- * re-test stream_running() to learn the transport is gone.
+ * Take the next packet and hand the same context straight back to USBD.
+ *
+ * There is no feeder thread and no free-context handshake because a completion
+ * is the only thing that ever frees a context, and it frees exactly one: the
+ * one it was called for.  Filling that context in the callback and resubmitting
+ * it there removes a thread wakeup, two event-flag calls and a context switch
+ * from every millisecond, and the ordering falls out rather than being
+ * arranged -- isochronous requests complete in the order they were queued, so
+ * the context reporting in is always the oldest and the packet it takes is
+ * always the next one due.
+ *
+ * The copy costs about fifty cycles.  The submit that follows it has been
+ * measured at 260-505 us, so nothing added here is close to the dominant term,
+ * and this callback was already making that call before the feeder was removed.
  */
-static void pump_ready(void)
+static void pcm_next(const void **packet);
+
+static void refill_context(StreamContext *context)
 {
-	/*
-	 * The first requester owns the drain.  Later requesters only add a ticket;
-	 * the owner consumes every ticket before leaving.  Unlike a boolean gate,
-	 * the same atomic operation both publishes work and hands ownership over,
-	 * so a READY transition cannot land between an owner's final scan and its
-	 * unlock and be lost there.
-	 */
-	if (__atomic_fetch_add(&tx.pump_requests, 1u, __ATOMIC_ACQ_REL) != 0u)
-		return;
+	const void *packet;
+	int submitted;
 
-	for (;;) {
-		while (stream_running() &&
-		       __atomic_load_n(&tx.primed, __ATOMIC_ACQUIRE) &&
-		       __atomic_load_n(&tx.in_flight, __ATOMIC_ACQUIRE) <
-		       MAX_IN_FLIGHT) {
-			StreamContext *context = claim_oldest_ready();
-			int submitted;
-
-			if (context == NULL)
-				break;
-			__atomic_add_fetch(&tx.in_flight, 1u, __ATOMIC_ACQ_REL);
-			COUNT_SUBMIT();
-			submitted = submit_context(context);
-			if (submitted == 0)
-				continue;
-
-			/*
-			 * Declined: no callback is coming, so reclaim it.
-			 * RELEASE, not ACQ_REL -- see the note in transfer_done.
-			 * The release store below supplies the acquire half, so
-			 * do not put a plain access between the two.
-			 */
-			__atomic_sub_fetch(&tx.in_flight, 1u, __ATOMIC_RELEASE);
-			__atomic_store_n(&context->state, CONTEXT_FREE,
-				__ATOMIC_RELEASE);
-			publish_free_context();
-			stop_stream(submitted < 0 ? submitted : 0, USBD_CC_NOERR);
-			break;
-		}
-
-		/*
-		 * A hole is the schedule running dry, not merely being full.  A
-		 * submit that just failed has already left STREAM_RUNNING, so it
-		 * cannot be miscounted as one.
-		 */
-		if (stream_running() &&
-		    __atomic_load_n(&tx.primed, __ATOMIC_ACQUIRE) &&
-		    __atomic_load_n(&tx.in_flight, __ATOMIC_ACQUIRE) == 0u)
-			COUNT_STARVE();
-
-		/* The last consumed ticket releases ownership. */
-		if (__atomic_fetch_sub(&tx.pump_requests, 1u, __ATOMIC_ACQ_REL) == 1u)
-			return;
-	}
+	pcm_next(&packet);
+	memcpy(context->buffer, packet, PACKET_BYTES);
+	COUNT_SUBMIT();
+	submitted = submit_context(context);
+	if (submitted != 0)
+		stop_stream(submitted < 0 ? submitted : 0, USBD_CC_NOERR);
 }
 
 static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
@@ -906,67 +758,10 @@ static void transfer_done(int32_t result, ksceUsbdIsochTransfer *sdk_transfer,
 		goto out;
 	}
 
-	__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
-	/*
-	 * RELEASE, not ACQ_REL: one dmb per completion.  ARM maps an
-	 * acquire-release RMW to dmb-ldrex/strex-dmb, so ACQ_REL here plus
-	 * pump_ready()'s ACQ_REL ticket increment emitted two barriers back to
-	 * back.  The dropped acquire half would have ordered the loads that
-	 * follow, and those sit behind the ticket increment's own barrier -- so
-	 * this is correct only while the next statement is an acquire-release
-	 * atomic.  Put a plain load between them and the ordering is gone.
-	 */
-	__atomic_sub_fetch(&tx.in_flight, 1u, __ATOMIC_RELEASE);
-	/*
-	 * Submit first, wake second, and not the other way round.  Both orderings
-	 * end with the same work done, but only one keeps the schedule fed.
-	 * publish_free_context() is a kernel call that can reschedule on the spot
-	 * -- the feeder sits at FEEDER_PRIORITY on this core, so waking it can
-	 * preempt this callback before the resubmit happens -- and the resubmit is
-	 * the deadline-bearing half: ksceUsbdIsochronousTransfer() has been
-	 * measured taking 260-505 us of a 1 ms frame.  Nothing the feeder can do
-	 * is urgent by comparison; the context it is being woken for went FREE
-	 * above and stays FREE.
-	 */
-	pump_ready();
-	publish_free_context();
+	refill_context(context);
 
 out:
 	callback_leave();
-}
-
-/*
- * Claim a context USBD does not own, blocking until one exists.  Scanning
- * before waiting is what makes the wakeup unloseable: a completion that posts
- * between the scan and the wait leaves FREE_EVENT_BIT set, and the wait returns
- * on it immediately.
- */
-static int wait_for_free_context(StreamContext **out)
-{
-	uint32_t matched;
-	uint32_t index;
-	int result;
-
-	for (;;) {
-		if (!stream_running())
-			return 0;
-		for (index = 0; index < CONTEXT_COUNT; ++index) {
-			/* The feeder is the sole FREE claimant. */
-			if (__atomic_load_n(&contexts[index].state,
-				__ATOMIC_ACQUIRE) != CONTEXT_FREE)
-				continue;
-			__atomic_store_n(&contexts[index].state,
-				CONTEXT_WRITING, __ATOMIC_RELAXED);
-			*out = &contexts[index];
-			return 1;
-		}
-		result = ksceKernelWaitEventFlag(free_event, FREE_EVENT_BIT,
-			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &matched, NULL);
-		if (result < 0) {
-			stop_stream(result, USBD_CC_NOERR);
-			return 0;
-		}
-	}
 }
 
 /*
@@ -1055,60 +850,6 @@ static void pcm_next(const void **packet)
 	cur.last = *packet;
 }
 
-/*
- * Stage one packet.  Returns non-zero only when there was no PCM to stage;
- * every other outcome, success or failure, leaves the caller to re-test
- * stream_running().
- *
- * Order matters: take USB-owned storage first, then sample the source.  The
- * reverse reads as equivalent and is not -- that wait is unbounded if a
- * completion is delayed, and a packet copied before it goes stale while we sit
- * in it.
- */
-static void queue_next_source_packet(void)
-{
-	StreamContext *context;
-	const void *packet;
-	uint32_t sequence;
-
-	if (!wait_for_free_context(&context))
-		return;
-	pcm_next(&packet);
-
-	/*
-	 * Take a copy rather than pointing the controller at Sony's slice.
-	 *
-	 * Pointing at it is free and was tried: 192 bytes and a cache clean a
-	 * millisecond is a fifth of a percent of a core, and the slice is stable
-	 * for block periods either side of the read.  What it changes is WHEN the
-	 * bytes are decided.  A copy fixes them here; a pointer leaves them to be
-	 * whatever the slice holds when the controller gets round to the transfer,
-	 * which is up to MAX_IN_FLIGHT frames later and a quarter second later if
-	 * the pipe freezes.
-	 *
-	 * That difference is audible.  Zero-copy desynchronises unless the reader
-	 * sits far enough back, and no account of the slack explains where the line
-	 * falls -- 15 packets of read-back is clean, 10 is not, while a copy is
-	 * clean at every distance tried including one block.  Whatever the pointer
-	 * exposes us to, the copy does not have it, and buying the same silence
-	 * with read-back costs latency rather than cycles.
-	 */
-	memcpy(context->buffer, packet, PACKET_BYTES);
-	context->transfer.buffer_base = context->buffer;
-
-	/* One writer, so a plain increment is enough; the release store below is
-	 * what publishes the new sequence to claim_oldest_ready(). */
-	sequence = ++cur.write_sequence;
-	context->sequence = sequence;
-	__atomic_store_n(&context->state, CONTEXT_READY, __ATOMIC_RELEASE);
-
-	/* The transport stays idle until every context holds a packet. */
-	if (sequence == CONTEXT_COUNT)
-		__atomic_store_n(&tx.primed, 1, __ATOMIC_RELEASE);
-	if (__atomic_load_n(&tx.primed, __ATOMIC_ACQUIRE))
-		pump_ready();
-}
-
 #ifdef UAC_PSTV_ENABLE_LOGGING
 static void report_session(void)
 {
@@ -1118,10 +859,8 @@ static void report_session(void)
 	uint32_t i;
 
 	uac_log(LOG_PREFIX
-		"session: %u packets, %u starved, %u pcm waits, %u slips, "
-		"%u freezes\n",
+		"session: %u packets, %u repeats, %u slips, %u freezes\n",
 		__atomic_load_n(&submit_count, __ATOMIC_RELAXED),
-		__atomic_load_n(&starve_count, __ATOMIC_RELAXED),
 		__atomic_load_n(&pcm_wait_count, __ATOMIC_RELAXED), total,
 		__atomic_load_n(&freeze_count, __ATOMIC_RELAXED));
 	/* Numbered by their real ordinal, so a run reads 331..338 rather than 1..8
@@ -1144,14 +883,12 @@ static void report_session(void)
 		for (i = 0; i < fz_shown; ++i) {
 			uint32_t k = (fz_first + i) % FREEZE_LOG_MAX;
 
-			uac_log(LOG_PREFIX
-				"  freeze %u at packet %u, %u us, %u in flight\n",
-				fz_first + i + 1u, freeze_at[k], freeze_gap[k],
-				freeze_flight[k]);
+			uac_log(LOG_PREFIX "  freeze %u at packet %u, %u us\n",
+				fz_first + i + 1u, freeze_at[k], freeze_gap[k]);
 		}
 	}
 	/*
-	 * The feeder has already left its loop, so this is where the queue ended
+	 * Submitting has already been refused, so this is where the queue ended
 	 * up.  Anywhere in FLOOR..TARGET says the two clocks kept station; at zero
 	 * the transport was outrunning the producer and the endpoint was going
 	 * unfed; near MAX the reverse.
@@ -1184,7 +921,6 @@ static void report_session(void)
 	}
 
 	__atomic_store_n(&submit_count, 0u, __ATOMIC_RELAXED);
-	__atomic_store_n(&starve_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&pcm_wait_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&slip_count, 0u, __ATOMIC_RELAXED);
 	__atomic_store_n(&freeze_count, 0u, __ATOMIC_RELAXED);
@@ -1195,62 +931,13 @@ static void report_session(void)
 #define REPORT_SESSION() ((void)0)
 #endif
 
-static int usb_feeder_thread(SceSize args, void *argp)
-{
-	(void)args;
-	(void)argp;
-	/*
-	 * The route is not this thread's to take.  session.c acquires it after
-	 * this feeder is already running, so the endpoint is fed silence for the
-	 * whole of AVConfig's ~400 ms convergence rather than seeing a gap; PCM
-	 * simply starts arriving partway through, and pcm_next() switches to it.
-	 */
-	while (stream_running())
-		queue_next_source_packet();
-	REPORT_SESSION();
-	return 0;
-}
-
-/*
- * Only the session thread creates or reaps the feeder, and feeder_thread is set
- * only for a thread that started, so there is no state machine here: either a
- * thread is running or the field is -1.
- */
-static int reap_feeder(SceUInt timeout_us)
-{
-	SceUID thread = __atomic_load_n(&feeder_thread, __ATOMIC_ACQUIRE);
-	int status;
-	int result;
-
-	if (thread < 0)
-		return 0;
-	result = ksceKernelWaitThreadEnd(thread, &status, &timeout_us);
-	if (result < 0)
-		return result;
-	result = ksceKernelDeleteThread(thread);
-	if (result < 0)
-		return result;
-	__atomic_store_n(&feeder_thread, -1, __ATOMIC_RELEASE);
-	finish_retire();
-	return 0;
-}
-
 int uac_stream_start(int pipe_id)
 {
 	int expected = STREAM_IDLE;
 	uint32_t generation;
 	uint32_t index;
-	int thread;
-	int result;
 
-	if (pipe_id < 0 || free_event < 0)
-		return -1;
-	/*
-	 * A feeder outliving its session means the last reap failed.  Refuse
-	 * rather than delete a thread that may still be running; the next
-	 * teardown retries it with the full timeout.
-	 */
-	if (__atomic_load_n(&feeder_thread, __ATOMIC_ACQUIRE) >= 0)
+	if (pipe_id < 0)
 		return -1;
 	if (!__atomic_compare_exchange_n(&tx.state, &expected,
 		STREAM_STARTING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -1264,18 +951,14 @@ int uac_stream_start(int pipe_id)
 	 * may have entered after that gate reopened and must be allowed to drop its
 	 * own reference without underflowing the new session's guard.
 	 */
-	__atomic_store_n(&tx.in_flight, 0u, __ATOMIC_RELEASE);
-	__atomic_store_n(&tx.pump_requests, 0u, __ATOMIC_RELEASE);
-	__atomic_store_n(&cur.write_sequence, 0u, __ATOMIC_RELEASE);
-	__atomic_store_n(&tx.primed, 0, __ATOMIC_RELEASE);
 	RESET_FREEZE();
 	memset(contexts, 0, sizeof(contexts));
 
 	/*
-	 * The source and the queue are reset here rather than on the feeder, so
-	 * they are ordered before audio_tap_begin() by the session thread itself.
-	 * An empty queue is what holds the feeder on silence until the producer has
-	 * published enough to start from.
+	 * The source and the queue are reset before anything is submitted, so they
+	 * are ordered ahead of audio_tap_begin() by the session thread itself.  An
+	 * empty queue is what makes the first packets silence until the producer
+	 * has published enough to start from.
 	 */
 	memset(&src, 0, sizeof(src));
 	memset(&queue, 0, sizeof(queue));
@@ -1288,34 +971,24 @@ int uac_stream_start(int pipe_id)
 		context->callback_token = generation | index;
 		context->transfer.buffer_base = context->buffer;
 		context->transfer.num_packets = 1u;
-		__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
 	}
 
-	reset_event(free_event);
-	publish_free_context();
-
-	thread = ksceKernelCreateThread("uac_usb_feeder", usb_feeder_thread,
-		FEEDER_PRIORITY, FEEDER_STACK, 0, FEEDER_CPU_MASK, NULL);
-	if (thread < 0) {
-		stop_stream(thread, USBD_CC_NOERR);
-		return thread;
-	}
-	/* RUNNING before the thread starts, so its first loop test cannot lose a
-	 * race with its own creation. */
+	/* RUNNING before the first submit: submit_context() refuses to queue
+	 * anything in any other state, and its completion is what keeps the
+	 * schedule fed from here on. */
 	expected = STREAM_STARTING;
 	if (!__atomic_compare_exchange_n(&tx.state, &expected, STREAM_RUNNING,
-		0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-		(void)ksceKernelDeleteThread(thread);
+		0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 		return -1;
-	}
-	__atomic_store_n(&feeder_thread, thread, __ATOMIC_RELEASE);
-	result = ksceKernelStartThread(thread, 0, NULL);
-	if (result < 0) {
-		__atomic_store_n(&feeder_thread, -1, __ATOMIC_RELEASE);
-		(void)ksceKernelDeleteThread(thread);
-		stop_stream(result, USBD_CC_NOERR);
-		return result;
-	}
+
+	/*
+	 * Prime the pipe by hand, once.  Every later submit is made by the
+	 * completion of the one before it, so this is the only place a request is
+	 * queued from outside the callback, and it is the whole of what the feeder
+	 * thread used to exist for.
+	 */
+	for (index = 0; index < MAX_IN_FLIGHT; ++index)
+		refill_context(&contexts[index]);
 
 	uac_log(LOG_PREFIX "ready: %u contexts, %u in flight, %u bytes/request\n",
 		CONTEXT_COUNT, MAX_IN_FLIGHT, PACKET_BYTES);
@@ -1325,20 +998,20 @@ int uac_stream_start(int pipe_id)
 void uac_stream_stop(void)
 {
 	uint32_t wait;
-	int result;
 
-	if (__atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) == STREAM_IDLE &&
-	    __atomic_load_n(&feeder_thread, __ATOMIC_ACQUIRE) < 0)
+	if (__atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) == STREAM_IDLE)
 		return;
 
+	/*
+	 * Refusing the next submit is the whole of the stop.  Every context is
+	 * resubmitted by its own completion, so once submit_context() declines
+	 * them the outstanding requests drain themselves and the reference count
+	 * falls to zero without anything to reap.
+	 */
 	__atomic_store_n(&tx.state, STREAM_STOPPING, __ATOMIC_RELEASE);
 	__atomic_fetch_or(&cb.guard, CALLBACK_CLOSING, __ATOMIC_ACQ_REL);
-	publish_free_context();
 
-	result = reap_feeder(FEEDER_STOP_TIMEOUT_US);
-	if (result < 0)
-		uac_log(LOG_PREFIX "USB feeder stop failed: 0x%08x\n", result);
-
+	REPORT_SESSION();
 	for (wait = 0; wait < STOP_POLLS; ++wait) {
 		if (!(__atomic_load_n(&cb.guard, __ATOMIC_ACQUIRE) & CALLBACK_REFS)) {
 			finish_retire();
@@ -1361,36 +1034,18 @@ void uac_stream_pipe_closed(int pipe_id)
 	/* Invalidate submitted tokens before finish_retire() can reopen the gate. */
 	(void)next_generation();
 	__atomic_store_n(&tx.pipe, -1, __ATOMIC_RELEASE);
-	publish_free_context();
 	finish_retire();
 }
 
 int uac_stream_init(void)
 {
-	int event;
-
-	if (free_event < 0) {
-		event = ksceKernelCreateEventFlag("uac_usb_free", 0, 0, NULL);
-		if (event < 0)
-			return event;
-		free_event = event;
-	}
+	/* Nothing to set up: the transport is static storage and a callback. */
 	return 0;
 }
 
 int uac_stream_shutdown(void)
 {
-	int result;
-
 	uac_stream_stop();
-	if (__atomic_load_n(&feeder_thread, __ATOMIC_ACQUIRE) >= 0 ||
-	    __atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) != STREAM_IDLE)
-		return -1;
-	if (free_event >= 0) {
-		result = ksceKernelDeleteEventFlag(free_event);
-		if (result < 0)
-			return result;
-		free_event = -1;
-	}
-	return 0;
+	return __atomic_load_n(&tx.state, __ATOMIC_ACQUIRE) == STREAM_IDLE ?
+		0 : -1;
 }
