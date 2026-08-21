@@ -7,12 +7,11 @@
  *     slices of AVConfig's RAM-output region and handing each finished block
  *     to a queue as five 1 ms packets;
  *   - the transport side runs one feeder thread that drains that queue a packet
- *     per frame, pointing the host controller straight at the slice.
+ *     per frame, copying each into the context the controller will read.
  *
- * Nothing copies the audio and nothing samples a position: the producer sets
- * both the content and the pace, and the queue depth is the only state between
- * them.  Its two bounds are the only places a discontinuity can enter, and both
- * are counted.
+ * Nothing samples a position: the producer sets both the content and the pace,
+ * and the queue depth is the only state between them.  Its two bounds are the
+ * only places a discontinuity can enter, and both are counted.
  *
  * The queue is latest-wins at the top, deliberately, and not a FIFO.  USB
  * completions have been measured stopping for 250 ms at a stretch with a full
@@ -33,6 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <psp2kern/kernel/cpu/cache.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/usbd.h>
 
@@ -77,11 +77,14 @@
  * and measuring how far back its first packet lies are different things, and the
  * second is what the queue arithmetic needs.
  *
- * The slack this leaves the producer to be late in is the trail times the block,
- * so it is the block length that decides whether one is enough.  At 96 frames
- * one block is 2 ms and hisses; at 240 it is 5 ms and does not.  Two blocks
- * measured no better than one at this size, which is what carrying 10 ms of
- * slack against a threshold nearer 4 would predict.
+ * Two is where this sits, and it is left there rather than argued down.  One
+ * desynchronised while the controller read Sony's slice directly, and no account
+ * of the slack explained it -- a trail of one at this block size is 5 ms, more
+ * than the 4 ms that ran clean for seven minutes at 192 frames.  Every distance
+ * that misbehaved did so with no copy in the path, and every distance tried with
+ * one, down to a single block, was clean.  So the copy is very likely what fixed
+ * it and one would very likely work again; try that before assuming this has to
+ * be two.
  *
  * PCM_QUEUE_MAX is where an overrun is cut back to, and it rides PCM_READ_BACK
  * so the queue lands on the same place however it got there.  It once tried to
@@ -94,7 +97,7 @@
  * a cursor.  The unsafe window is microseconds, not a period.
  */
 #define PACKETS_PER_BLOCK (UAC_STREAM_CAPTURE_FRAMES / PACKET_FRAMES)
-#define PCM_TRAIL_BLOCKS 1u
+#define PCM_TRAIL_BLOCKS 2u
 #define PCM_READ_BACK ((PCM_TRAIL_BLOCKS + 1u) * PACKETS_PER_BLOCK)
 #define PCM_QUEUE_SLOTS 16u
 #define PCM_QUEUE_MASK (PCM_QUEUE_SLOTS - 1u)
@@ -136,17 +139,16 @@
  * Feeder scheduling.  0x40 is the bottom of the kernel band and a poor place
  * for a thread with a 1 ms deadline; 0x20 lifts it clear while staying below
  * the capture worker's 0x12, which must not be starved because it is the
- * producer.  Per wakeup the feeder takes a context, pops a pointer and blocks
+ * producer.  Per wakeup the feeder takes a context, copies 192 bytes and blocks
  * again, so it cannot monopolise a core.
  *
- * The affinity outlived its reason.  It was a cache decision -- share the
- * capture worker's core (CAPTURE_CPU_MASK in audio_tap.c) and a slice Sony had
- * just filled would still be in L1 when the feeder copied it out -- but the
- * feeder no longer reads the audio at all, so there is nothing left to be warm.
- * What sharing a core does now is put the two threads in each other's way, the
- * capture worker holding spinlocks inside ram_submit() while the feeder has a
- * 1 ms deadline.  Worth measuring apart; left alone because it is what every
- * session so far was measured on.
+ * The affinity is a cache decision rather than a scheduling one: pinned to the
+ * capture worker's core (CAPTURE_CPU_MASK in audio_tap.c), a slice Sony has just
+ * filled is still in L1 when the feeder copies it out.  Set against that, the two
+ * threads are in each other's way -- the capture worker holds spinlocks inside
+ * ram_submit() while the feeder has a 1 ms deadline -- so it is worth measuring
+ * apart at some point.  Left alone because every session so far was measured on
+ * it.
  */
 #define FEEDER_PRIORITY 0x20
 #define FEEDER_CPU_MASK 0x80000u
@@ -224,20 +226,24 @@ STATIC_ASSERT(PCM_QUEUE_SLOTS > PCM_READ_BACK &&
  * How long a slice must survive after publication, and the one number here that
  * is measured rather than derived.
  *
- * An entry points into Sony's memory, so the engine must not write that slice
- * again before the controller has read it -- and the controller reads it at the
- * far end of both waits, the queue and the schedule.  Nothing on this side can
- * observe when the engine comes back to a slice; the only evidence is reading
- * further and further back and listening.  Sixteen packets played clean at
- * 192 x 4, so sixteen is demonstrated.  Nothing establishes anything past it.
+ * The engine must not write a slice again before the feeder has taken its
+ * packets out of it.  The copy is what makes that a bound on the queue alone:
+ * the bytes are lifted at the pop, so the requests USBD is holding no longer
+ * extend the window the way they did when the controller read the slice itself.
  *
- * Kept as an assertion rather than a comment because the failure has no symptom
- * a counter can catch: a slice read while the engine rewrites it passes the
- * queue, passes the transfer and sounds like a dirty edge.  A geometry that
- * walks past the evidence should stop the build, not the ear.
+ * Nothing on this side can observe when the engine comes back to a slice.  The
+ * only evidence is reading further and further back and listening, and 18
+ * packets from publication to the wire played clean at this geometry, so the
+ * queue's 15 is well inside it.  The figure moves only when someone plays the
+ * thing and reports back.
+ *
+ * An assertion rather than a comment because the failure has no symptom a
+ * counter can catch: a slice read while the engine rewrites it passes the queue,
+ * passes the transfer and sounds like a dirty edge.  A geometry that walks past
+ * the evidence should stop the build, not the ear.
  */
-#define PCM_PROVEN_READ_DEPTH 16u
-STATIC_ASSERT(PCM_READ_BACK + MAX_IN_FLIGHT <= PCM_PROVEN_READ_DEPTH,
+#define PCM_PROVEN_READ_DEPTH 18u
+STATIC_ASSERT(PCM_READ_BACK <= PCM_PROVEN_READ_DEPTH,
 	read_depth_must_stay_inside_what_has_been_measured);
 /* Keeps every slice line-aligned, not just the first. */
 STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % UAC_ERG == 0u,
@@ -289,9 +295,18 @@ STATIC_ASSERT(offsetof(SonyIsoTransfer, packets) == 0x08u,
  * per submit, and CONTEXT_ALIGN is only keeping each context's state word out of
  * its neighbour's reservation granule.
  */
-#define CONTEXT_ALIGN 64u
+/*
+ * CONTEXT_ALIGN is a DMA constraint, not a cache one.  buffer[] is the only
+ * storage the host controller reads, and EHCI addresses a transfer buffer as a
+ * page plus an offset, so one straddling a 4 KiB boundary needs the descriptor's
+ * second page pointer programmed too.  Aligning each context to a divisor of the
+ * page size, buffer first and no larger than that alignment, keeps every buffer
+ * inside one page by construction.
+ */
+#define CONTEXT_ALIGN 256u
 
 typedef struct {
+	uint8_t buffer[PACKET_BYTES] __attribute__((aligned(64)));
 	SonyIsoTransfer transfer __attribute__((aligned(64)));
 	uint32_t callback_token;
 	uint32_t sequence;
@@ -300,30 +315,15 @@ typedef struct {
 
 STATIC_ASSERT(sizeof(StreamContext) == CONTEXT_ALIGN,
 	context_must_tile_its_alignment);
-STATIC_ASSERT(CONTEXT_ALIGN >= UAC_ERG,
-	contexts_must_not_share_a_reservation_granule);
+STATIC_ASSERT(PACKET_BYTES <= CONTEXT_ALIGN, context_buffer_must_fit_one_block);
+STATIC_ASSERT(4096u % CONTEXT_ALIGN == 0u, context_blocks_must_tile_a_page);
 
-/*
- * EHCI addresses a transfer buffer as a page plus an offset, so one straddling a
- * 4 KiB boundary needs the descriptor's second page pointer programmed too.
- * Every packet the controller reads must therefore sit inside one page.
- *
- * Two of the three conditions are geometry and are settled here: packets tile a
- * slice, and the slice stride divides a page.  The third is where Sony's region
- * happens to start, which only the firmware knows, so it is checked once when
- * the region is published.
- */
-STATIC_ASSERT(UAC_STREAM_SLICE_BYTES % PACKET_BYTES == 0u ||
-	(UAC_STREAM_CAPTURE_BYTES / PACKET_BYTES) * PACKET_BYTES <=
-		UAC_STREAM_SLICE_BYTES,
+/* Packets have to tile a slice for the copy to take one without spanning two. */
+STATIC_ASSERT(UAC_STREAM_CAPTURE_BYTES % PACKET_BYTES == 0u,
 	packets_must_tile_a_slice);
-STATIC_ASSERT(4096u % UAC_STREAM_SLICE_BYTES == 0u,
-	slice_stride_must_divide_a_page);
 
-/* Sent while capture has published nothing yet; read by the controller, so it
- * needs the same page containment as a slice does. */
-static const uint8_t pcm_silence[PACKET_BYTES]
-	__attribute__((aligned(4096)));
+/* Sent while capture has published nothing yet. */
+static const uint8_t pcm_silence[PACKET_BYTES] __attribute__((aligned(64)));
 
 static StreamContext contexts[CONTEXT_COUNT]
 	__attribute__((aligned(CONTEXT_ALIGN)));
@@ -775,19 +775,11 @@ static int submit_context(StreamContext *context)
 		return 1;
 
 	/*
-	 * No cache maintenance.  Nothing on this side writes the bytes the
-	 * controller is about to read -- Sony's engine put them in memory by DMA
-	 * and we only ever load from them -- so there is no dirty line to clean,
-	 * and cleaning would risk writing a stale one back over the engine's work.
-	 *
-	 * The cost of that is the buffer staying live until this completes.  A
-	 * queued request holds a pointer into a slice for as long as the schedule
-	 * takes to reach it, which is a frame or three normally and one whole wrap
-	 * of the periodic list when the pipe freezes.  The ring turns over in
-	 * COUNT block periods, so a freeze outlives it and the controller sends
-	 * whatever the engine has since written there.  That is the price of not
-	 * copying, and it is paid in torn audio on the far side of a freeze.
+	 * After the aborts, not before: a teardown should not pay for a flush.
+	 * The feeder wrote this buffer with the CPU, so the lines have to reach
+	 * memory before the controller reads them.
 	 */
+	ksceKernelDcacheCleanRange(context->buffer, PACKET_BYTES);
 	return ksceUsbdIsochronousTransfer(
 		pipe,
 		(ksceUsbdIsochTransfer *)(void *)&context->transfer,
@@ -1084,11 +1076,25 @@ static void queue_next_source_packet(void)
 	pcm_next(&packet);
 
 	/*
-	 * The whole of staging, now: the controller is pointed at Sony's slice and
-	 * reads it where it lies.  Which also means the bytes are not ours and stay
-	 * live until the transfer completes -- see the note on submit_context().
+	 * Take a copy rather than pointing the controller at Sony's slice.
+	 *
+	 * Pointing at it is free and was tried: 192 bytes and a cache clean a
+	 * millisecond is a fifth of a percent of a core, and the slice is stable
+	 * for block periods either side of the read.  What it changes is WHEN the
+	 * bytes are decided.  A copy fixes them here; a pointer leaves them to be
+	 * whatever the slice holds when the controller gets round to the transfer,
+	 * which is up to MAX_IN_FLIGHT frames later and a quarter second later if
+	 * the pipe freezes.
+	 *
+	 * That difference is audible.  Zero-copy desynchronises unless the reader
+	 * sits far enough back, and no account of the slack explains where the line
+	 * falls -- 15 packets of read-back is clean, 10 is not, while a copy is
+	 * clean at every distance tried including one block.  Whatever the pointer
+	 * exposes us to, the copy does not have it, and buying the same silence
+	 * with read-back costs latency rather than cycles.
 	 */
-	context->transfer.buffer_base = (void *)(uintptr_t)packet;
+	memcpy(context->buffer, packet, PACKET_BYTES);
+	context->transfer.buffer_base = context->buffer;
 
 	/* One writer, so a plain increment is enough; the release store below is
 	 * what publishes the new sequence to claim_oldest_ready(). */
@@ -1280,7 +1286,7 @@ int uac_stream_start(int pipe_id)
 		StreamContext *context = &contexts[index];
 
 		context->callback_token = generation | index;
-		context->transfer.buffer_base = (void *)(uintptr_t)pcm_silence;
+		context->transfer.buffer_base = context->buffer;
 		context->transfer.num_packets = 1u;
 		__atomic_store_n(&context->state, CONTEXT_FREE, __ATOMIC_RELEASE);
 	}
