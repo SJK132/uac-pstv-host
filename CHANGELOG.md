@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.3 - 2026-08-20
+
+- Sony's audio engine now writes captured PCM straight into the staging slices,
+  so nothing copies it on the way in. The two-page ping-pong and the private PCM
+  ring it fed are both gone.
+- The producer drives the transport. Each finished block is queued as 1 ms
+  packets and drained one per USB frame, which removes the free-running cursor
+  and the fences that existed to keep it from drifting.
+- Removed the USB feeder thread. A completion frees exactly one request, so it
+  refills and resubmits that one itself; per millisecond this drops a thread
+  wakeup, two event-flag calls and a context switch, and halves the kernel calls
+  per packet.
+- Capture blocks are 240 frames, waking the capture worker 200 times a second
+  where earlier releases woke it 500.
+- Fixed continuous distortion on any geometry whose block size lands on a
+  256-byte boundary. Sony's DMA writes past the block, to the next multiple
+  strictly greater than it, which the slice stride now accounts for.
+- Improved system software stability and performance.
+
+### Instrumentation
+
+- The session line reports repeats, slips and freezes, with the queue's final
+  state, the packet each slip and freeze occurred at, and the rate error between
+  Sony's clock and the USB frame timer in parts per million. Replaces the starve
+  and resync counters, which no longer describe anything the transport can do.
+
+The 250 ms USB stalls are confirmed to happen with three requests already
+queued, so they are below this layer rather than starvation. Recovery costs one
+discontinuity: the queue discards the backlog and resumes at current audio.
+
 ## v1.2 - 2026-08-15
 
 - Rewrote the session lifecycle around a single owning thread. Setup and
